@@ -10,5 +10,5 @@ set -e
 CKPT=${1:?Usage: bash scripts/run_phase2.sh <checkpoint_path>}
 DEVICE=${2:-cuda}
 echo "Phase 2: checkpoint=${CKPT}, device=${DEVICE}"
-python experiments/run_phase2.py --checkpoint "${CKPT}" --device "${DEVICE}"
+uv run python experiments/run_phase2.py --checkpoint "${CKPT}" --device "${DEVICE}"
 echo "→ results/phase2_results.json"

@@ -73,26 +73,29 @@ Track 3 (Evolution):  Kill bottom α%, clone top α% + noise  →  regularisatio
 ├── evaluate.py            # Full evaluation suite (accuracy, NLL, ECE, OOD, selective)
 ├── visualize.py           # Publication-quality plots
 ├── data_utils.py          # CIFAR-10/100, SVHN loaders
-└── requirements.txt
+└── pyproject.toml         # Project config & dependencies (uv)
 ```
 
 ## Quick Start
 
 ```bash
-# Install dependencies
-pip install -r requirements.txt
+# Install uv (if not installed)
+curl -LsSf https://astral.sh/uv/install.sh | sh
+
+# Sync project (creates .venv + installs all deps)
+uv sync
 
 # Train NPM on CIFAR-10
-python train.py --config configs/default.yaml --device cuda
+uv run python train.py --config configs/default.yaml --device cuda
 
 # Compare with baselines (Phase 1)
-python experiments/run_phase1.py --epochs 100
+uv run python experiments/run_phase1.py --epochs 100
 
 # OOD detection (Phase 2, needs checkpoint)
-python experiments/run_phase2.py --checkpoint runs/<timestamp>/ckpt_epoch200.pt
+uv run python experiments/run_phase2.py --checkpoint runs/<timestamp>/ckpt_epoch200.pt
 
 # Ablation study (Phase 3)
-python experiments/run_phase3.py --epochs 100
+uv run python experiments/run_phase3.py --epochs 100
 ```
 
 ## Research Plan

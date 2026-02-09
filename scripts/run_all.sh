@@ -29,7 +29,7 @@ echo ""
 echo "══════════════════════════════════════════"
 echo "  PHASE 1 — Sanity Check (NPM vs Baselines)"
 echo "══════════════════════════════════════════"
-python experiments/run_phase1.py \
+uv run python experiments/run_phase1.py \
     --config configs/default.yaml \
     --epochs "${EPOCHS}" \
     --device "${DEVICE}"
@@ -44,7 +44,7 @@ echo ""
 echo "══════════════════════════════════════════"
 echo "  Training main NPM (for Phase 2)"
 echo "══════════════════════════════════════════"
-python train.py \
+uv run python train.py \
     --config configs/default.yaml \
     --epochs "${EPOCHS}" \
     --device "${DEVICE}"
@@ -64,7 +64,7 @@ else
     echo "══════════════════════════════════════════"
     echo "  PHASE 2 — OOD Detection (CIFAR-100, SVHN)"
     echo "══════════════════════════════════════════"
-    python experiments/run_phase2.py \
+    uv run python experiments/run_phase2.py \
         --checkpoint "${LATEST_CKPT}" \
         --device "${DEVICE}"
 
@@ -79,7 +79,7 @@ fi
 echo "══════════════════════════════════════════"
 echo "  PHASE 3 — Ablation Study"
 echo "══════════════════════════════════════════"
-python experiments/run_phase3.py \
+uv run python experiments/run_phase3.py \
     --config configs/default.yaml \
     --epochs "${EPOCHS}" \
     --device "${DEVICE}"
@@ -101,4 +101,4 @@ echo "  results/phase2_results.json    — OOD detection AUROC/AUPR"
 echo "  results/phase3_ablation.json   — Ablation: what matters in NPM"
 echo ""
 echo "TensorBoard logs:"
-echo "  tensorboard --logdir runs/"
+echo "  uv run tensorboard --logdir runs/"
