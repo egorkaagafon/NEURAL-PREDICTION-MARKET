@@ -1,0 +1,62 @@
+# ─── Neural Prediction Market — CIFAR-100 Config ───
+# Same architecture, 100 classes instead of 10.
+
+seed: 42
+device: "cuda"
+
+# ── Data ──
+data:
+  dataset: "cifar100"
+  root: "./data"
+  batch_size: 128
+  num_workers: 4
+  augmentation: true
+
+# ── Model ──
+model:
+  image_size: 32
+  patch_size: 4
+  embed_dim: 256
+  depth: 6
+  num_heads: 8
+  num_agents: 16
+  num_classes: 100     # ← auto-set from dataset, but explicit here
+  dropout: 0.1
+
+# ── Market ──
+market:
+  initial_capital: 1.0
+  capital_lr: 0.02
+  capital_ema: 0.999
+  min_capital: 1.0e-4
+  max_capital: 100.0
+  bet_temperature: 1.0
+  evolution_enabled: true
+  evolution_interval: 1
+  kill_fraction: 0.1
+  mutation_std: 0.02
+  diversity_weight: 0.1
+
+# ── Training ──
+training:
+  epochs: 200
+  optimizer: "adamw"
+  lr: 3.0e-4
+  weight_decay: 0.05
+  warmup_epochs: 10
+  scheduler: "cosine"
+  label_smoothing: 0.0
+  gradient_clip: 1.0
+
+# ── Logging ──
+logging:
+  log_dir: "./runs"
+  log_interval: 50
+  save_interval: 10
+  tensorboard: true
+
+# ── Evaluation ──
+evaluation:
+  ood_datasets: ["svhn"]   # CIFAR-10 becomes OOD when training on CIFAR-100
+  volatility_eps: 0.01
+  volatility_steps: 5

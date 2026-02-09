@@ -28,7 +28,7 @@ from models.vit_npm import NeuralPredictionMarket
 from npm_core.market import MarketAggregator
 from npm_core.capital import CapitalManager
 from npm_core.uncertainty import uncertainty_report
-from data_utils import get_cifar10_loaders
+from data_utils import get_loaders, num_classes_for
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -69,7 +69,15 @@ def train(cfg: dict):
     torch.manual_seed(cfg["seed"])
 
     # ── Data ──
-    train_loader, test_loader = get_cifar10_loaders(
+    dataset = cfg["data"].get("dataset", "cifar10")
+    # Auto-set num_classes from dataset if not explicitly overridden
+    auto_classes = num_classes_for(dataset)
+    if cfg["model"]["num_classes"] != auto_classes:
+        print(f"Auto-setting num_classes={auto_classes} for dataset={dataset}")
+        cfg["model"]["num_classes"] = auto_classes
+
+    train_loader, test_loader = get_loaders(
+        dataset=dataset,
         root=cfg["data"]["root"],
         batch_size=cfg["data"]["batch_size"],
         num_workers=cfg["data"]["num_workers"],
