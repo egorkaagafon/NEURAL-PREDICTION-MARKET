@@ -1,0 +1,72 @@
+# ─── Neural Prediction Market — Default Config ───
+# All hyperparameters in one place for reproducibility.
+
+seed: 42
+device: "cuda"        # "cuda" or "cpu"
+
+# ── Data ──
+data:
+  dataset: "cifar10"   # cifar10 | cifar100 | svhn
+  root: "./data"
+  batch_size: 128
+  num_workers: 4
+  augmentation: true
+
+# ── Model ──
+model:
+  # ViT backbone
+  image_size: 32
+  patch_size: 4
+  embed_dim: 256
+  depth: 6              # number of Transformer blocks
+  num_heads: 8           # heads per block (standard attention)
+
+  # NPM agents
+  num_agents: 16         # independent classifier heads (traders)
+  num_classes: 10
+  dropout: 0.1
+
+# ── Market ──
+market:
+  # Capital dynamics
+  initial_capital: 1.0
+  capital_lr: 0.02       # η for C_i ← C_i * exp(η * log p_i(y))
+  capital_ema: 0.999     # smooth capital to avoid spikes
+  min_capital: 1.0e-4    # bankruptcy threshold
+  max_capital: 100.0     # cap to prevent runaway
+
+  # Betting
+  bet_temperature: 1.0   # temperature for bet sigmoid
+
+  # Evolutionary selection
+  evolution_enabled: true
+  evolution_interval: 1  # epochs between selection rounds
+  kill_fraction: 0.1     # bottom α% replaced
+  mutation_std: 0.02     # noise added to cloned weights
+
+  # Diversity bonus (anti-herding)
+  diversity_weight: 0.1  # λ for KL-diversity regularizer
+
+# ── Training ──
+training:
+  epochs: 200
+  optimizer: "adamw"
+  lr: 3.0e-4
+  weight_decay: 0.05
+  warmup_epochs: 10
+  scheduler: "cosine"
+  label_smoothing: 0.0   # we rely on market dynamics instead
+  gradient_clip: 1.0
+
+# ── Logging ──
+logging:
+  log_dir: "./runs"
+  log_interval: 50       # steps
+  save_interval: 10      # epochs
+  tensorboard: true
+
+# ── Evaluation ──
+evaluation:
+  ood_datasets: ["cifar100", "svhn"]
+  volatility_eps: 0.01   # ε for volatility probing
+  volatility_steps: 5    # number of perturbation samples
