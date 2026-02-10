@@ -111,7 +111,7 @@ class CapitalManager:
         agent_pool: nn.ModuleList,
         kill_fraction: float = 0.1,
         mutation_std: float = 0.02,
-    ):
+    ) -> list[int]:
         """Replace the worst‑performing agents with mutated copies of the best.
 
         This implements replicator–mutator dynamics:
@@ -129,6 +129,11 @@ class CapitalManager:
             Fraction of agents to replace (e.g. 0.1 = bottom 10 %).
         mutation_std : float
             Standard deviation of Gaussian noise added to cloned weights.
+
+        Returns
+        -------
+        list[int]
+            Indices of the agents that were replaced (for optimizer state reset).
         """
         K = self.num_agents
         n_kill = max(1, int(K * kill_fraction))
@@ -153,6 +158,8 @@ class CapitalManager:
             # Reset capital to median (fresh start, not zero)
             self.capital[w] = median_capital
             self.capital_ema[w] = median_capital
+
+        return worst_idx
 
     # ------------------------------------------------------------------
     def state_dict(self) -> dict:

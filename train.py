@@ -217,6 +217,7 @@ def train(cfg: dict):
             with torch.no_grad():
                 payoffs = market.agent_payoffs(
                     out["all_probs"].detach(), targets,
+                    bets=out["all_bets"].detach(),
                 )
                 capital_mgr.update(payoffs)
 
@@ -268,13 +269,20 @@ def train(cfg: dict):
         # ── Evolutionary selection ──
         if (mkt["evolution_enabled"]
                 and epoch % mkt["evolution_interval"] == 0):
-            capital_mgr.evolutionary_step(
+            mutated_indices = capital_mgr.evolutionary_step(
                 model.agent_pool.agents,
                 kill_fraction=mkt["kill_fraction"],
                 mutation_std=mkt["mutation_std"],
             )
-            print(f"  → Evolution: replaced bottom "
-                  f"{mkt['kill_fraction']:.0%} of agents")
+            # Reset optimizer state for mutated agents to avoid
+            # stale momentum/variance pushing new weights in old directions
+            if mutated_indices:
+                for idx in mutated_indices:
+                    for param in model.agent_pool.agents[idx].parameters():
+                        if param in optimizer.state:
+                            del optimizer.state[param]
+            print(f"  → Evolution: replaced agents {mutated_indices}, "
+                  f"optimizer state reset")
 
         # ── Validation ──
         if epoch % save_interval == 0 or epoch == cfg["training"]["epochs"]:

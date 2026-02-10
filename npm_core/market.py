@@ -77,10 +77,17 @@ class MarketAggregator:
     def agent_payoffs(
         probs: torch.Tensor,          # [K, B, C]
         targets: torch.Tensor,        # [B]
+        bets: torch.Tensor = None,    # [K, B]  (optional)
     ) -> torch.Tensor:
-        """Per‑agent log‑loss payoff (used for capital updates, NOT backprop).
+        """Per‑agent bet‑weighted payoff (used for capital updates, NOT backprop).
 
-        R_i = mean_over_batch  log p_i(y_true)
+        R_i = mean_over_batch [ b_i · log p_i(y_true) + (1 - b_i) · 0 ]
+
+        If an agent bets b_i≈0 it neither gains nor loses capital
+        ("safe haven" / cash position).  Only the fraction of capital
+        that is actually staked is at risk.
+
+        Without bets (backward compat): R_i = mean log p_i(y_true).
 
         Returns
         -------
@@ -91,6 +98,11 @@ class MarketAggregator:
         idx = targets.unsqueeze(0).expand(K, B).unsqueeze(-1)  # [K, B, 1]
         p_true = probs.gather(dim=2, index=idx).squeeze(-1)    # [K, B]
         log_p = torch.log(p_true.clamp(min=1e-8))              # [K, B]
+
+        if bets is not None:
+            # Bet‑weighted: staked fraction earns/loses, unstaked is safe
+            log_p = bets * log_p   # [K, B]  — b_i≈0 → payoff≈0
+
         payoffs = log_p.mean(dim=1)                             # [K]
         return payoffs
 
