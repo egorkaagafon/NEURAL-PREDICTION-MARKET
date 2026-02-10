@@ -32,6 +32,22 @@ from data_utils import get_loaders, num_classes_for
 
 
 # ══════════════════════════════════════════════════════════════════════
+#  A100 / GPU optimizations
+# ══════════════════════════════════════════════════════════════════════
+
+def setup_cuda_optimizations():
+    """Enable hardware-level speedups (TF32, cudnn benchmark)."""
+    if not torch.cuda.is_available():
+        return
+    # TF32 — free ~3× speedup on A100 matmuls (19-bit mantissa, fine for training)
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    # cuDNN auto-tuner — pick fastest conv algorithm for fixed input size
+    torch.backends.cudnn.benchmark = True
+    print("CUDA optimizations: TF32=ON, cudnn.benchmark=ON")
+
+
+# ══════════════════════════════════════════════════════════════════════
 #  Helpers
 # ══════════════════════════════════════════════════════════════════════
 
@@ -67,6 +83,7 @@ def build_scheduler(optimizer, cfg: dict, steps_per_epoch: int):
 def train(cfg: dict):
     device = torch.device(cfg["device"] if torch.cuda.is_available() else "cpu")
     torch.manual_seed(cfg["seed"])
+    setup_cuda_optimizations()
 
     # ── Data ──
     dataset = cfg["data"].get("dataset", "cifar10")
@@ -82,6 +99,8 @@ def train(cfg: dict):
         batch_size=cfg["data"]["batch_size"],
         num_workers=cfg["data"]["num_workers"],
         augmentation=cfg["data"]["augmentation"],
+        persistent_workers=cfg["data"].get("persistent_workers", False),
+        prefetch_factor=cfg["data"].get("prefetch_factor", 2),
     )
 
     # ── Model ──
@@ -99,6 +118,19 @@ def train(cfg: dict):
     ).to(device)
 
     print(f"Model parameters: {model.count_parameters():,}")
+
+    # ── torch.compile (PyTorch 2.0+) — fused kernels, ~20-40% speedup ──
+    use_compile = cfg.get("performance", {}).get("compile", False)
+    if use_compile and hasattr(torch, "compile"):
+        model = torch.compile(model, mode="reduce-overhead")
+        print("torch.compile enabled (reduce-overhead mode)")
+
+    # ── AMP (mixed precision) ──
+    use_amp = cfg.get("performance", {}).get("amp", False) and device.type == "cuda"
+    amp_dtype = getattr(torch, cfg.get("performance", {}).get("amp_dtype", "bfloat16"))
+    scaler = torch.amp.GradScaler(enabled=(use_amp and amp_dtype == torch.float16))
+    if use_amp:
+        print(f"AMP enabled (dtype={amp_dtype})")
 
     # ── Capital ──
     mkt = cfg["market"]
@@ -138,28 +170,32 @@ def train(cfg: dict):
 
         pbar = tqdm(train_loader, desc=f"Epoch {epoch}", leave=False)
         for images, targets in pbar:
-            images, targets = images.to(device), targets.to(device)
+            images = images.to(device, non_blocking=True)
+            targets = targets.to(device, non_blocking=True)
 
-            # ── Forward ──
+            # ── Forward (with optional AMP) ──
             capital = capital_mgr.get_capital()
-            out = model(images, capital)
+            with torch.amp.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
+                out = model(images, capital)
 
-            # ── Market loss (backprop) ──
-            loss_market = market.compute_market_loss(
-                out["market_probs"], targets,
-                label_smoothing=cfg["training"]["label_smoothing"],
-            )
+                # ── Market loss (backprop) ──
+                loss_market = market.compute_market_loss(
+                    out["market_probs"], targets,
+                    label_smoothing=cfg["training"]["label_smoothing"],
+                )
 
-            # Diversity regularizer (anti‑herding)
-            loss_div = market.diversity_loss(out["all_probs"])
-            loss = loss_market + diversity_w * loss_div
+                # Diversity regularizer (anti‑herding)
+                loss_div = market.diversity_loss(out["all_probs"])
+                loss = loss_market + diversity_w * loss_div
 
-            # ── Backprop ──
-            optimizer.zero_grad()
-            loss.backward()
+            # ── Backprop (with GradScaler for fp16, no-op for bf16) ──
+            optimizer.zero_grad(set_to_none=True)
+            scaler.scale(loss).backward()
             if grad_clip > 0:
+                scaler.unscale_(optimizer)
                 nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-            optimizer.step()
+            scaler.step(optimizer)
+            scaler.update()
             scheduler.step()
 
             # ── Capital update (no grad) ──
@@ -226,7 +262,8 @@ def train(cfg: dict):
 
         # ── Validation ──
         if epoch % save_interval == 0 or epoch == cfg["training"]["epochs"]:
-            val_acc, val_nll = evaluate(model, test_loader, capital_mgr, device)
+            val_acc, val_nll = evaluate(model, test_loader, capital_mgr, device,
+                                         use_amp=use_amp, amp_dtype=amp_dtype)
             print(f"  → Val acc {val_acc:.2%}  |  NLL {val_nll:.4f}")
             if writer:
                 writer.add_scalar("val/accuracy", val_acc, epoch)
@@ -259,6 +296,8 @@ def evaluate(
     loader,
     capital_mgr: CapitalManager,
     device: torch.device,
+    use_amp: bool = False,
+    amp_dtype: torch.dtype = torch.bfloat16,
 ):
     model.eval()
     correct = 0
@@ -269,8 +308,10 @@ def evaluate(
     capital = capital_mgr.get_capital()
 
     for images, targets in loader:
-        images, targets = images.to(device), targets.to(device)
-        out = model(images, capital)
+        images = images.to(device, non_blocking=True)
+        targets = targets.to(device, non_blocking=True)
+        with torch.amp.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
+            out = model(images, capital)
 
         pred = out["market_probs"].argmax(dim=-1)
         correct += (pred == targets).sum().item()

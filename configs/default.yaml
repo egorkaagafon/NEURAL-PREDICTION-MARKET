@@ -8,9 +8,11 @@ device: "cuda"        # "cuda" or "cpu"
 data:
   dataset: "cifar10"   # cifar10 | cifar100 | svhn
   root: "./data"
-  batch_size: 128
-  num_workers: 4
+  batch_size: 512        # A100 can easily handle 512+ for CIFAR
+  num_workers: 8
   augmentation: true
+  persistent_workers: true   # keep workers alive between epochs
+  prefetch_factor: 4         # batches prefetched per worker
 
 # ── Model ──
 model:
@@ -57,6 +59,12 @@ training:
   scheduler: "cosine"
   label_smoothing: 0.0   # we rely on market dynamics instead
   gradient_clip: 1.0
+
+# ── Performance (A100 optimizations) ──
+performance:
+  amp: true              # automatic mixed precision
+  amp_dtype: "bfloat16"  # bf16 native on A100 (no scaler needed, more stable than fp16)
+  compile: true          # torch.compile — ~20-40% speedup (PyTorch 2.0+)
 
 # ── Logging ──
 logging:

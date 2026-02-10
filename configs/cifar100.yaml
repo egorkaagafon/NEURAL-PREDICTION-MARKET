@@ -8,9 +8,11 @@ device: "cuda"
 data:
   dataset: "cifar100"
   root: "./data"
-  batch_size: 128
-  num_workers: 4
+  batch_size: 512
+  num_workers: 8
   augmentation: true
+  persistent_workers: true
+  prefetch_factor: 4
 
 # ── Model ──
 model:
@@ -47,6 +49,12 @@ training:
   scheduler: "cosine"
   label_smoothing: 0.0
   gradient_clip: 1.0
+
+# ── Performance (A100 optimizations) ──
+performance:
+  amp: true
+  amp_dtype: "bfloat16"
+  compile: true
 
 # ── Logging ──
 logging:

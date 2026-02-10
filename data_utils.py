@@ -17,6 +17,8 @@ def get_cifar10_loaders(
     batch_size: int = 128,
     num_workers: int = 4,
     augmentation: bool = True,
+    persistent_workers: bool = False,
+    prefetch_factor: int = 2,
 ) -> Tuple[DataLoader, DataLoader]:
     """Standard CIFAR‑10 train/test loaders with optional augmentation."""
 
@@ -48,10 +50,14 @@ def get_cifar10_loaders(
     train_loader = DataLoader(
         train_ds, batch_size=batch_size, shuffle=True,
         num_workers=num_workers, pin_memory=True, drop_last=True,
+        persistent_workers=persistent_workers and num_workers > 0,
+        prefetch_factor=prefetch_factor if num_workers > 0 else None,
     )
     test_loader = DataLoader(
         test_ds, batch_size=batch_size, shuffle=False,
         num_workers=num_workers, pin_memory=True,
+        persistent_workers=persistent_workers and num_workers > 0,
+        prefetch_factor=prefetch_factor if num_workers > 0 else None,
     )
     return train_loader, test_loader
 
@@ -81,6 +87,8 @@ def get_cifar100_loaders(
     batch_size: int = 128,
     num_workers: int = 4,
     augmentation: bool = True,
+    persistent_workers: bool = False,
+    prefetch_factor: int = 2,
 ) -> Tuple[DataLoader, DataLoader]:
     """Standard CIFAR‑100 train/test loaders with optional augmentation."""
 
@@ -110,10 +118,14 @@ def get_cifar100_loaders(
     train_loader = DataLoader(
         train_ds, batch_size=batch_size, shuffle=True,
         num_workers=num_workers, pin_memory=True, drop_last=True,
+        persistent_workers=persistent_workers and num_workers > 0,
+        prefetch_factor=prefetch_factor if num_workers > 0 else None,
     )
     test_loader = DataLoader(
         test_ds, batch_size=batch_size, shuffle=False,
         num_workers=num_workers, pin_memory=True,
+        persistent_workers=persistent_workers and num_workers > 0,
+        prefetch_factor=prefetch_factor if num_workers > 0 else None,
     )
     return train_loader, test_loader
 
@@ -124,12 +136,17 @@ def get_loaders(
     batch_size: int = 128,
     num_workers: int = 4,
     augmentation: bool = True,
+    persistent_workers: bool = False,
+    prefetch_factor: int = 2,
 ) -> Tuple[DataLoader, DataLoader]:
     """Universal loader dispatcher — returns (train_loader, test_loader)."""
+    kw = dict(root=root, batch_size=batch_size, num_workers=num_workers,
+              augmentation=augmentation, persistent_workers=persistent_workers,
+              prefetch_factor=prefetch_factor)
     if dataset == "cifar10":
-        return get_cifar10_loaders(root, batch_size, num_workers, augmentation)
+        return get_cifar10_loaders(**kw)
     elif dataset == "cifar100":
-        return get_cifar100_loaders(root, batch_size, num_workers, augmentation)
+        return get_cifar100_loaders(**kw)
     else:
         raise ValueError(f"Unknown training dataset: {dataset}. "
                          f"Supported: cifar10, cifar100")
