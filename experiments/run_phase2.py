@@ -42,7 +42,13 @@ def load_checkpoint(ckpt_path: str, device: torch.device):
     # Handle torch.compile _orig_mod. prefix in older checkpoints
     sd = ckpt["model_state_dict"]
     sd = {k.replace("_orig_mod.", ""): v for k, v in sd.items()}
-    model.load_state_dict(sd)
+    missing, unexpected = model.load_state_dict(sd, strict=False)
+    if missing:
+        print(f"  [load_checkpoint] Missing keys (will use random init): "
+              f"{[k.split('.')[-1] for k in missing]}")
+    if unexpected:
+        print(f"  [load_checkpoint] Unexpected keys (ignored): "
+              f"{[k.split('.')[-1] for k in unexpected]}")
 
     capital_mgr = CapitalManager(
         num_agents=mc["num_agents"],
