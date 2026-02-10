@@ -156,6 +156,7 @@ def train(cfg: dict):
 
     market = MarketAggregator()
     diversity_w = mkt["diversity_weight"]
+    agent_aux_w = mkt.get("agent_aux_weight", 0.3)  # per-agent auxiliary loss weight
     grad_clip = cfg["training"]["gradient_clip"]
 
     global_step = 0
@@ -184,9 +185,23 @@ def train(cfg: dict):
                     label_smoothing=cfg["training"]["label_smoothing"],
                 )
 
+                # Per-agent auxiliary loss — each agent independently
+                # minimises its own CE.  This is the KEY mechanism that
+                # gives each agent its own gradient signal and prevents
+                # them from collapsing to the same solution.
+                K, B, C = out["all_probs"].shape
+                agent_log_probs = torch.log(out["all_probs"].clamp(min=1e-8))  # [K,B,C]
+                tgt_expanded = targets.unsqueeze(0).expand(K, B)               # [K,B]
+                loss_agent_aux = F.nll_loss(
+                    agent_log_probs.reshape(K * B, C),
+                    tgt_expanded.reshape(K * B),
+                )
+
                 # Diversity regularizer (anti‑herding)
                 loss_div = market.diversity_loss(out["all_probs"])
-                loss = loss_market + diversity_w * loss_div
+                loss = (loss_market
+                        + agent_aux_w * loss_agent_aux
+                        + diversity_w * loss_div)
 
             # ── Backprop (with GradScaler for fp16, no-op for bf16) ──
             optimizer.zero_grad(set_to_none=True)
@@ -227,6 +242,7 @@ def train(cfg: dict):
                 cap_info = capital_mgr.summary()
                 writer.add_scalar("train/loss", loss.item(), global_step)
                 writer.add_scalar("train/loss_market", loss_market.item(), global_step)
+                writer.add_scalar("train/loss_agent_aux", loss_agent_aux.item(), global_step)
                 writer.add_scalar("train/loss_diversity", loss_div.item(), global_step)
                 writer.add_scalar("train/accuracy",
                                   correct / targets.size(0), global_step)

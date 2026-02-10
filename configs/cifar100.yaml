@@ -37,8 +37,7 @@ market:
   evolution_interval: 5
   kill_fraction: 0.1
   mutation_std: 0.02
-  diversity_weight: 0.3
-
+  diversity_weight: 0.3  agent_aux_weight: 0.3
 # ── Training ──
 training:
   epochs: 200

@@ -32,8 +32,8 @@ model:
 market:
   # Capital dynamics
   initial_capital: 1.0
-  capital_lr: 0.1        # η for C_i ← C_i * exp(η * log p_i(y)) — higher = faster differentiation
-  capital_ema: 0.99      # smooth capital (0.99 tracks faster than 0.999)
+  capital_lr: 0.5        # η for C_i ← C_i * exp(η * log p_i(y)) — aggressive to amplify small differences
+  capital_ema: 0.95      # smooth capital (lower = faster reaction to payoff differences)
   min_capital: 1.0e-4    # bankruptcy threshold
   max_capital: 100.0     # cap to prevent runaway
 
@@ -48,6 +48,9 @@ market:
 
   # Diversity bonus (anti-herding)
   diversity_weight: 0.3  # λ for KL-diversity regularizer (push agents apart)
+
+  # Per-agent auxiliary loss (breaks gradient symmetry)
+  agent_aux_weight: 0.3  # λ_aux — each agent's individual CE loss
 
 # ── Training ──
 training:
