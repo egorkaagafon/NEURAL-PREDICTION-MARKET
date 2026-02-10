@@ -269,11 +269,14 @@ def train(cfg: dict):
                 writer.add_scalar("val/accuracy", val_acc, epoch)
                 writer.add_scalar("val/nll", val_nll, epoch)
 
-            # Save checkpoint
+            # Save checkpoint (unwrap torch.compile prefix if present)
             ckpt_path = log_dir / f"ckpt_epoch{epoch:03d}.pt"
+            raw_sd = model.state_dict()
+            # torch.compile wraps keys with _orig_mod. — strip it for portability
+            clean_sd = {k.replace("_orig_mod.", ""): v for k, v in raw_sd.items()}
             torch.save({
                 "epoch": epoch,
-                "model_state_dict": model.state_dict(),
+                "model_state_dict": clean_sd,
                 "optimizer_state_dict": optimizer.state_dict(),
                 "capital": capital_mgr.state_dict(),
                 "config": cfg,

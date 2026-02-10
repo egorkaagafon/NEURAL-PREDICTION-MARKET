@@ -28,16 +28,16 @@ model:
 # ── Market ──
 market:
   initial_capital: 1.0
-  capital_lr: 0.02
-  capital_ema: 0.999
+  capital_lr: 0.1
+  capital_ema: 0.99
   min_capital: 1.0e-4
   max_capital: 100.0
   bet_temperature: 1.0
   evolution_enabled: true
-  evolution_interval: 1
+  evolution_interval: 5
   kill_fraction: 0.1
   mutation_std: 0.02
-  diversity_weight: 0.1
+  diversity_weight: 0.3
 
 # ── Training ──
 training:

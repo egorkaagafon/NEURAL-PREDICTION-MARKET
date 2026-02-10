@@ -39,7 +39,10 @@ def load_checkpoint(ckpt_path: str, device: torch.device):
         num_classes=mc["num_classes"], dropout=mc["dropout"],
         bet_temperature=mkt["bet_temperature"],
     ).to(device)
-    model.load_state_dict(ckpt["model_state_dict"])
+    # Handle torch.compile _orig_mod. prefix in older checkpoints
+    sd = ckpt["model_state_dict"]
+    sd = {k.replace("_orig_mod.", ""): v for k, v in sd.items()}
+    model.load_state_dict(sd)
 
     capital_mgr = CapitalManager(
         num_agents=mc["num_agents"],

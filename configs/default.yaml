@@ -32,8 +32,8 @@ model:
 market:
   # Capital dynamics
   initial_capital: 1.0
-  capital_lr: 0.02       # η for C_i ← C_i * exp(η * log p_i(y))
-  capital_ema: 0.999     # smooth capital to avoid spikes
+  capital_lr: 0.1        # η for C_i ← C_i * exp(η * log p_i(y)) — higher = faster differentiation
+  capital_ema: 0.99      # smooth capital (0.99 tracks faster than 0.999)
   min_capital: 1.0e-4    # bankruptcy threshold
   max_capital: 100.0     # cap to prevent runaway
 
@@ -42,12 +42,12 @@ market:
 
   # Evolutionary selection
   evolution_enabled: true
-  evolution_interval: 1  # epochs between selection rounds
+  evolution_interval: 5  # epochs between selection rounds (give capital time to diverge)
   kill_fraction: 0.1     # bottom α% replaced
   mutation_std: 0.02     # noise added to cloned weights
 
   # Diversity bonus (anti-herding)
-  diversity_weight: 0.1  # λ for KL-diversity regularizer
+  diversity_weight: 0.3  # λ for KL-diversity regularizer (push agents apart)
 
 # ── Training ──
 training:

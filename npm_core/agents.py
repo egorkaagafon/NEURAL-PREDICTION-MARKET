@@ -37,6 +37,8 @@ class AgentHead(nn.Module):
         Dropout probability in hidden layer.
     bet_temperature : float
         Controls sharpness of the learned bet size.
+    agent_id : int
+        Index of this agent (used for diverse initialisation).
     """
 
     def __init__(
@@ -46,12 +48,22 @@ class AgentHead(nn.Module):
         hidden_dim: Optional[int] = None,
         dropout: float = 0.1,
         bet_temperature: float = 1.0,
+        agent_id: int = 0,
     ):
         super().__init__()
         self.num_classes = num_classes
         self.bet_temperature = bet_temperature
 
         hid = hidden_dim or in_dim
+
+        # Per-agent feature projection — each agent "sees" a different
+        # linear view of the shared backbone features, breaking symmetry
+        # and enabling genuine specialisation.
+        self.feature_proj = nn.Sequential(
+            nn.Linear(in_dim, in_dim),
+            nn.GELU(),
+        )
+
         self.classifier = nn.Sequential(
             nn.LayerNorm(in_dim),
             nn.Linear(in_dim, hid),
@@ -70,13 +82,18 @@ class AgentHead(nn.Module):
             nn.Linear(hid // 2, 1),
         )
 
-        self._init_weights()
+        self._init_weights(agent_id)
 
     # ------------------------------------------------------------------
-    def _init_weights(self):
+    def _init_weights(self, agent_id: int = 0):
+        # Use different random seed offset per agent for diverse initialisation
+        g = torch.Generator()
+        g.manual_seed(42 + agent_id * 137)
         for m in self.modules():
             if isinstance(m, nn.Linear):
-                nn.init.trunc_normal_(m.weight, std=0.02)
+                # Slightly different scale per agent to break symmetry
+                std = 0.02 * (1.0 + 0.1 * (agent_id % 5))
+                nn.init.trunc_normal_(m.weight, std=std, generator=g)
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
 
@@ -94,10 +111,11 @@ class AgentHead(nn.Module):
         probs  : Tensor [B, C]   — softmax(logits)
         bet    : Tensor [B]      — ∈ (0, 1]
         """
-        logits = self.classifier(features)                    # [B, C]
+        h = self.feature_proj(features)                       # [B, D] — agent-specific view
+        logits = self.classifier(h)                           # [B, C]
         probs = F.softmax(logits, dim=-1)                     # [B, C]
 
-        raw_bet = self.bet_head(features).squeeze(-1)         # [B]
+        raw_bet = self.bet_head(h).squeeze(-1)                # [B]
         # Sigmoid + small ε to keep bet in (ε, 1]
         bet = torch.sigmoid(raw_bet / self.bet_temperature)   # [B]
         bet = bet.clamp(min=1e-6)
@@ -133,8 +151,9 @@ class AgentPool(nn.Module):
                 num_classes=num_classes,
                 dropout=dropout,
                 bet_temperature=bet_temperature,
+                agent_id=i,
             )
-            for _ in range(num_agents)
+            for i in range(num_agents)
         ])
 
     # ------------------------------------------------------------------
