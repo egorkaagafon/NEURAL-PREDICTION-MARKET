@@ -139,9 +139,7 @@ def train(cfg: dict):
         num_agents=mc["num_agents"],
         initial_capital=mkt["initial_capital"],
         lr=mkt["capital_lr"],
-        ema=mkt["capital_ema"],
-        min_capital=mkt["min_capital"],
-        max_capital=mkt["max_capital"],
+        decay=mkt.get("capital_decay", 0.9),
         normalize_payoffs=mkt.get("normalize_payoffs", True),
         device=device,
     )
@@ -215,13 +213,13 @@ def train(cfg: dict):
             scaler.update()
             scheduler.step()
 
-            # ── Capital update (no grad) ──
+            # ── Capital accumulate (no grad) ──
             with torch.no_grad():
                 payoffs = market.agent_payoffs(
                     out["all_probs"].detach(), targets,
                     bets=out["all_bets"].detach(),
                 )
-                capital_mgr.update(payoffs)
+                capital_mgr.accumulate(payoffs)
 
             # ── Running stats ──
             with torch.no_grad():
@@ -261,7 +259,9 @@ def train(cfg: dict):
             pbar.set_postfix(loss=f"{loss.item():.3f}",
                              acc=f"{correct / targets.size(0):.2%}")
 
-        # ── End of epoch ──
+        # ── End of epoch: consolidate capital ──
+        capital_mgr.step()
+
         train_acc = epoch_correct / epoch_total
         train_loss = epoch_loss / epoch_total
         cap_sum = capital_mgr.summary()

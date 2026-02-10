@@ -30,12 +30,11 @@ model:
 
 # ── Market ──
 market:
-  # Capital dynamics
+  # Capital dynamics (log-space, epoch-level, mean-reverting)
   initial_capital: 1.0
-  capital_lr: 0.5        # η for C_i ← C_i * exp(η * log p_i(y)) — aggressive to amplify small differences
-  capital_ema: 0.95      # smooth capital (lower = faster reaction to payoff differences)
-  min_capital: 1.0e-4    # bankruptcy threshold
-  max_capital: 100.0     # cap to prevent runaway
+  capital_lr: 0.1        # η for S_i ← γ·S_i + η·z_i (epoch-level z-score step)
+  capital_decay: 0.9     # γ — decay toward equal weights (0.9 = 10-epoch memory window)
+  normalize_payoffs: true # standardise epoch payoffs to z-scores before update
 
   # Betting
   bet_temperature: 1.0   # temperature for bet sigmoid
@@ -71,15 +70,15 @@ performance:
   amp_dtype: "bfloat16"  # bf16 native on A100 (no scaler needed, more stable than fp16)
   compile: true          # torch.compile — ~20-40% speedup (PyTorch 2.0+)
 
+# ── Evaluation ──
+evaluation:
+  ood_datasets: ["cifar100", "svhn"]
+  volatility_eps: 0.05     # perturbation magnitude (0.01 was too small for normalized images)
+  volatility_steps: 10     # number of perturbation samples
+
 # ── Logging ──
 logging:
   log_dir: "./runs"
   log_interval: 50       # steps
   save_interval: 10      # epochs
   tensorboard: true
-
-# ── Evaluation ──
-evaluation:
-  ood_datasets: ["cifar100", "svhn"]
-  volatility_eps: 0.01   # ε for volatility probing
-  volatility_steps: 5    # number of perturbation samples

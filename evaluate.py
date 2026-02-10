@@ -189,6 +189,12 @@ def ood_detection_scores(
     id_scores = collect_scores(id_loader)
     ood_scores = collect_scores(ood_loader)
 
+    # Herding is an ID-confidence score (high = agents agree strongly).
+    # For OOD detection we need higher scores = more likely OOD, so invert.
+    if score_fn == "herding":
+        id_scores = -id_scores
+        ood_scores = -ood_scores
+
     # Labels: 0 = ID, 1 = OOD
     labels = np.concatenate([
         np.zeros(len(id_scores)),

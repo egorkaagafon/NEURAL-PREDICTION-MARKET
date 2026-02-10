@@ -83,8 +83,8 @@ def train_npm(cfg, train_loader, device, epochs=100):
     capital_mgr = CapitalManager(
         num_agents=mc["num_agents"],
         initial_capital=mkt["initial_capital"],
-        lr=mkt["capital_lr"], ema=mkt["capital_ema"],
-        min_capital=mkt["min_capital"], max_capital=mkt["max_capital"],
+        lr=mkt["capital_lr"],
+        decay=mkt.get("capital_decay", 0.9),
         normalize_payoffs=mkt.get("normalize_payoffs", True),
         device=device,
     )
@@ -95,6 +95,7 @@ def train_npm(cfg, train_loader, device, epochs=100):
         optimizer, T_max=epochs,
     )
     market = MarketAggregator()
+    agent_aux_w = mkt.get("agent_aux_weight", 0.3)
 
     for epoch in range(1, epochs + 1):
         model.train()
@@ -110,7 +111,19 @@ def train_npm(cfg, train_loader, device, epochs=100):
 
             loss_market = market.compute_market_loss(out["market_probs"], targets)
             loss_div = market.diversity_loss(out["all_probs"])
-            loss = loss_market + mkt["diversity_weight"] * loss_div
+
+            # Per-agent auxiliary loss (matches train.py)
+            K, B, C = out["all_probs"].shape
+            agent_log_probs = torch.log(out["all_probs"].clamp(min=1e-8))
+            tgt_expanded = targets.unsqueeze(0).expand(K, B)
+            loss_agent_aux = F.nll_loss(
+                agent_log_probs.reshape(K * B, C),
+                tgt_expanded.reshape(K * B),
+            )
+
+            loss = (loss_market
+                    + agent_aux_w * loss_agent_aux
+                    + mkt["diversity_weight"] * loss_div)
 
             optimizer.zero_grad()
             loss.backward()
@@ -118,8 +131,11 @@ def train_npm(cfg, train_loader, device, epochs=100):
             optimizer.step()
 
             with torch.no_grad():
-                payoffs = market.agent_payoffs(out["all_probs"].detach(), targets)
-                capital_mgr.update(payoffs)
+                payoffs = market.agent_payoffs(
+                    out["all_probs"].detach(), targets,
+                    bets=out["all_bets"].detach(),
+                )
+                capital_mgr.accumulate(payoffs)
 
             pred = out["market_probs"].argmax(-1)
             correct += (pred == targets).sum().item()
@@ -127,6 +143,9 @@ def train_npm(cfg, train_loader, device, epochs=100):
             total_loss += loss.item() * targets.size(0)
 
         scheduler.step()
+
+        # Consolidate epoch capital
+        capital_mgr.step()
 
         if mkt["evolution_enabled"] and epoch % mkt["evolution_interval"] == 0:
             capital_mgr.evolutionary_step(

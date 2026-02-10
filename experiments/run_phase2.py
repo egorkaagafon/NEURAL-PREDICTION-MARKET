@@ -54,8 +54,8 @@ def load_checkpoint(ckpt_path: str, device: torch.device):
     capital_mgr = CapitalManager(
         num_agents=mc["num_agents"],
         initial_capital=mkt["initial_capital"],
-        lr=mkt["capital_lr"], ema=mkt["capital_ema"],
-        min_capital=mkt["min_capital"], max_capital=mkt["max_capital"],
+        lr=mkt["capital_lr"],
+        decay=mkt.get("capital_decay", 0.9),
         normalize_payoffs=mkt.get("normalize_payoffs", True),
         device=device,
     )
