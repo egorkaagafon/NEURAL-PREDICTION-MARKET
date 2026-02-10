@@ -28,11 +28,13 @@ model:
 # ── Market ──
 market:
   initial_capital: 1.0
-  capital_lr: 0.1
-  capital_ema: 0.99
+  capital_lr: 0.5
+  capital_ema: 0.95
   min_capital: 1.0e-4
   max_capital: 100.0
   bet_temperature: 1.0
+  feature_keep_prob: 0.7
+  normalize_payoffs: true
   evolution_enabled: true
   evolution_interval: 5
   kill_fraction: 0.1

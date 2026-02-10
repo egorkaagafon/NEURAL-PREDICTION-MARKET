@@ -49,6 +49,7 @@ class CapitalManager:
         ema: float = 0.999,
         min_capital: float = 1e-4,
         max_capital: float = 100.0,
+        normalize_payoffs: bool = True,
         device: str = "cpu",
     ):
         self.num_agents = num_agents
@@ -56,6 +57,7 @@ class CapitalManager:
         self.ema = ema
         self.min_capital = min_capital
         self.max_capital = max_capital
+        self.normalize_payoffs = normalize_payoffs
 
         self.capital = torch.full(
             (num_agents,), initial_capital, dtype=torch.float32, device=device
@@ -64,24 +66,44 @@ class CapitalManager:
         self.capital_ema = self.capital.clone()
         # History for analysis / plotting
         self.history: list[torch.Tensor] = []
+        # Diagnostic: last payoff stats
+        self._last_payoff_raw = None
+        self._last_payoff_norm = None
 
     # ------------------------------------------------------------------
     @torch.no_grad()
     def update(self, payoffs: torch.Tensor):
-        """Multiplicative log‑wealth update.
+        """Multiplicative log‑wealth update with payoff standardisation.
 
         Parameters
         ----------
         payoffs : Tensor [K]
             Per‑agent mean log p_i(y_true) for the current batch.
         """
+        self._last_payoff_raw = payoffs.clone()
+
+        # ── Payoff standardisation ────────────────────────────────────
+        # Raw payoffs can differ by <1e-6 when agents share a backbone,
+        # making exp(lr * raw) ≈ 1.0 for everyone → Gini stays 0.
+        #
+        # Standardising to z-scores (μ=0, σ=1) guarantees that the best
+        # agent gets ≈+1 and the worst ≈-1 REGARDLESS of the absolute
+        # payoff scale.  exp(0.5 * 1) ≈ 1.65 per batch → meaningful
+        # capital divergence from the very first step.
+        if self.normalize_payoffs:
+            mu = payoffs.mean()
+            sigma = payoffs.std()
+            if sigma > 1e-12:   # guard: if all identical, skip
+                payoffs = ((payoffs - mu) / sigma).clamp(-3.0, 3.0)
+        self._last_payoff_norm = payoffs.clone()
+
         # Multiplicative update: C_i *= exp(η * R_i)
         self.capital = self.capital * torch.exp(self.lr * payoffs)
 
         # Clamp to [min, max]
         self.capital.clamp_(min=self.min_capital, max=self.max_capital)
 
-        # EMA smoothing
+        # EMA smoothing (kept for optional use)
         self.capital_ema = (
             self.ema * self.capital_ema + (1 - self.ema) * self.capital
         )
@@ -91,8 +113,8 @@ class CapitalManager:
 
     # ------------------------------------------------------------------
     def get_capital(self) -> torch.Tensor:
-        """Return current (smoothed) capital vector [K]."""
-        return self.capital_ema
+        """Return current RAW capital vector [K] (no EMA smoothing)."""
+        return self.capital
 
     # ------------------------------------------------------------------
     def get_raw_capital(self) -> torch.Tensor:
@@ -176,7 +198,7 @@ class CapitalManager:
     def summary(self) -> dict:
         """Diagnostic snapshot."""
         c = self.capital
-        return {
+        info = {
             "mean": c.mean().item(),
             "std": c.std().item(),
             "min": c.min().item(),
@@ -184,6 +206,16 @@ class CapitalManager:
             "gini": _gini(c).item(),
             "num_bankrupt": int(self.bankruptcy_mask().sum().item()),
         }
+        # Include payoff diagnostics if available
+        if self._last_payoff_raw is not None:
+            r = self._last_payoff_raw
+            info["payoff_raw_mean"] = r.mean().item()
+            info["payoff_raw_std"] = r.std().item()
+            info["payoff_raw_spread"] = (r.max() - r.min()).item()
+        if self._last_payoff_norm is not None:
+            n = self._last_payoff_norm
+            info["payoff_norm_spread"] = (n.max() - n.min()).item()
+        return info
 
 
 # ── Utility ──────────────────────────────────────────────────────────

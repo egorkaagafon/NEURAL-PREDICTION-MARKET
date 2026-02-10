@@ -152,6 +152,7 @@ class NeuralPredictionMarket(nn.Module):
         num_classes: int = 10,
         dropout: float = 0.1,
         bet_temperature: float = 1.0,
+        feature_keep_prob: float = 0.7,
     ):
         super().__init__()
         self.num_agents = num_agents
@@ -172,6 +173,7 @@ class NeuralPredictionMarket(nn.Module):
             num_classes=num_classes,
             dropout=dropout,
             bet_temperature=bet_temperature,
+            feature_keep_prob=feature_keep_prob,
         )
 
         self.market = MarketAggregator()

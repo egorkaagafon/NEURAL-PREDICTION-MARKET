@@ -115,6 +115,7 @@ def train(cfg: dict):
         num_classes=mc["num_classes"],
         dropout=mc["dropout"],
         bet_temperature=cfg["market"]["bet_temperature"],
+        feature_keep_prob=cfg["market"].get("feature_keep_prob", 0.7),
     ).to(device)
 
     print(f"Model parameters: {model.count_parameters():,}")
@@ -141,6 +142,7 @@ def train(cfg: dict):
         ema=mkt["capital_ema"],
         min_capital=mkt["min_capital"],
         max_capital=mkt["max_capital"],
+        normalize_payoffs=mkt.get("normalize_payoffs", True),
         device=device,
     )
 
@@ -262,9 +264,15 @@ def train(cfg: dict):
         # ── End of epoch ──
         train_acc = epoch_correct / epoch_total
         train_loss = epoch_loss / epoch_total
+        cap_sum = capital_mgr.summary()
         print(f"Epoch {epoch:3d}  |  loss {train_loss:.4f}  |  "
               f"acc {train_acc:.2%}  |  "
-              f"capital gini {capital_mgr.summary()['gini']:.3f}")
+              f"capital gini {cap_sum['gini']:.4f}  "
+              f"std {cap_sum['std']:.4f}  "
+              f"range [{cap_sum['min']:.3f}, {cap_sum['max']:.3f}]")
+        if 'payoff_raw_std' in cap_sum:
+            print(f"         payoff raw spread {cap_sum['payoff_raw_spread']:.6f}  "
+                  f"norm spread {cap_sum.get('payoff_norm_spread', 0):.3f}")
 
         # ── Evolutionary selection ──
         if (mkt["evolution_enabled"]

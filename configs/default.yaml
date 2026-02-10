@@ -39,6 +39,8 @@ market:
 
   # Betting
   bet_temperature: 1.0   # temperature for bet sigmoid
+  feature_keep_prob: 0.7  # each agent sees random 70% of backbone features (structural diversity)
+  normalize_payoffs: true # standardise payoffs to z-scores before capital update
 
   # Evolutionary selection
   evolution_enabled: true

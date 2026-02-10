@@ -49,12 +49,26 @@ class AgentHead(nn.Module):
         dropout: float = 0.1,
         bet_temperature: float = 1.0,
         agent_id: int = 0,
+        feature_keep_prob: float = 0.7,
     ):
         super().__init__()
         self.num_classes = num_classes
         self.bet_temperature = bet_temperature
+        self.agent_id = agent_id
 
         hid = hidden_dim or in_dim
+
+        # ── Per-agent feature mask (STRUCTURAL diversity) ────────────
+        # Each agent randomly zeros ~30 % of backbone dimensions.
+        # The mask is fixed (non-learnable) so agents are *forced*
+        # to develop different specialisations — they literally
+        # cannot see the same input, unlike a learned projection
+        # that eventually converges to identity under shared gradients.
+        g_mask = torch.Generator()
+        g_mask.manual_seed(42 + agent_id * 137)
+        mask = (torch.rand(in_dim, generator=g_mask) < feature_keep_prob).float()
+        # Scale by 1/keep_prob to preserve feature magnitude (like inverted dropout)
+        self.register_buffer('feature_mask', mask / max(feature_keep_prob, 1e-6))
 
         # Per-agent feature projection — each agent "sees" a different
         # linear view of the shared backbone features, breaking symmetry
@@ -111,7 +125,8 @@ class AgentHead(nn.Module):
         probs  : Tensor [B, C]   — softmax(logits)
         bet    : Tensor [B]      — ∈ (0, 1]
         """
-        h = self.feature_proj(features)                       # [B, D] — agent-specific view
+        h = features * self.feature_mask                        # [B, D] — masked subset
+        h = self.feature_proj(h)                                  # [B, D] — agent-specific view
         logits = self.classifier(h)                           # [B, C]
         probs = F.softmax(logits, dim=-1)                     # [B, C]
 
@@ -142,6 +157,7 @@ class AgentPool(nn.Module):
         num_classes: int,
         dropout: float = 0.1,
         bet_temperature: float = 1.0,
+        feature_keep_prob: float = 0.7,
     ):
         super().__init__()
         self.num_agents = num_agents
@@ -152,6 +168,7 @@ class AgentPool(nn.Module):
                 dropout=dropout,
                 bet_temperature=bet_temperature,
                 agent_id=i,
+                feature_keep_prob=feature_keep_prob,
             )
             for i in range(num_agents)
         ])

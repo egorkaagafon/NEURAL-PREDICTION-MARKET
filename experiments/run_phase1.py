@@ -77,6 +77,7 @@ def train_npm(cfg, train_loader, device, epochs=100):
         num_heads=mc["num_heads"], num_agents=mc["num_agents"],
         num_classes=mc["num_classes"], dropout=mc["dropout"],
         bet_temperature=mkt["bet_temperature"],
+        feature_keep_prob=mkt.get("feature_keep_prob", 0.7),
     ).to(device)
 
     capital_mgr = CapitalManager(
@@ -84,6 +85,7 @@ def train_npm(cfg, train_loader, device, epochs=100):
         initial_capital=mkt["initial_capital"],
         lr=mkt["capital_lr"], ema=mkt["capital_ema"],
         min_capital=mkt["min_capital"], max_capital=mkt["max_capital"],
+        normalize_payoffs=mkt.get("normalize_payoffs", True),
         device=device,
     )
 
