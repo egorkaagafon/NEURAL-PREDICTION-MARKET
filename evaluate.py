@@ -148,7 +148,7 @@ def selective_risk_curve(
         risks.append(risk)
 
     risks = np.array(risks)
-    aurc = np.trapz(risks, coverages)
+    aurc = np.trapezoid(risks, coverages)
 
     return {"coverage": coverages, "risk": risks, "aurc": aurc}
 
