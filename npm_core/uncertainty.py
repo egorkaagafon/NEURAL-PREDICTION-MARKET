@@ -222,6 +222,7 @@ def uncertainty_report(
         herding         : [B]  — consensus + concentration score
         gini            : [B]  — capital concentration per sample
         entropy_market  : [B]  — Shannon entropy of market prediction
+        market_unc      : [B]  — combined: epistemic × entropy (NPM‑native)
     """
     liq = market_liquidity(bets, capital)
     epi = liquidity_uncertainty(bets, capital, running_liquidity_mean)
@@ -237,10 +238,18 @@ def uncertainty_report(
     mp = (ww * probs).sum(0) / ww.sum(0).clamp(min=1e-8)
     ent = -(mp * mp.clamp(min=1e-8).log()).sum(-1)
 
+    # Combined market uncertainty: epistemic (low liquidity) × entropy
+    # Both signals are informative but capture different phenomena:
+    #   - epi  high → agents reluctant to bet (capacity‑based)
+    #   - ent  high → prediction spread (information‑based)
+    # Product gives a stronger OOD/selective‑prediction signal.
+    market_unc = epi * ent
+
     return {
         "liquidity": liq,
         "epistemic_unc": epi,
         "herding": herd,
         "gini": gini,
         "entropy_market": ent,
+        "market_unc": market_unc,
     }

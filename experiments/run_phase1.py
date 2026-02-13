@@ -244,6 +244,10 @@ def main():
         npm_eval["probs"], npm_eval["targets"],
         npm_eval["uncertainty"]["entropy_market"],
     )
+    npm_sr_market = selective_risk_curve(
+        npm_eval["probs"], npm_eval["targets"],
+        npm_eval["uncertainty"]["market_unc"],
+    )
     results["npm"] = {
         "accuracy": npm_eval["accuracy"],
         "nll": npm_eval["nll"],
@@ -251,6 +255,7 @@ def main():
         "ece": npm_eval["ece"],
         "aurc_epistemic": npm_sr_epist["aurc"],
         "aurc_entropy": npm_sr_entropy["aurc"],
+        "aurc_market": npm_sr_market["aurc"],
         "train_time_s": round(npm_train_time, 1),
     }
     print(f"NPM: {results['npm']}")
@@ -394,8 +399,9 @@ def main():
         brier = r.get('brier', 0)
         ece = r.get('ece', 0)
         extra = ""
-        if 'aurc_epistemic' in r:
-            extra = f"  aurc_epist={r['aurc_epistemic']:.4f}"
+        if 'aurc_market' in r:
+            extra = (f"  aurc_market={r['aurc_market']:.4f}"
+                     f"  aurc_epist={r['aurc_epistemic']:.4f}")
         print(f"  {name:15s}: acc={r['accuracy']:.2%}  nll={r['nll']:.4f}  "
               f"brier={brier:.4f}  ece={ece:.4f}  aurc={aurc_e:.4f}{extra}  "
               f"time={t:.0f}s")

@@ -47,7 +47,7 @@ def full_evaluation(
     all_targets = []
     all_unc = {
         "liquidity": [], "epistemic_unc": [], "herding": [],
-        "gini": [], "entropy_market": [],
+        "gini": [], "entropy_market": [], "market_unc": [],
     }
     all_agent_probs = []
     all_bets = []
