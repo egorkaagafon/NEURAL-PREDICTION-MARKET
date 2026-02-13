@@ -45,7 +45,7 @@ market:
   evolution_enabled: true
   evolution_interval: 20 # epochs between selection rounds (give capital time to diverge)
   kill_fraction: 0.1     # bottom α% replaced
-  mutation_std: 0.02     # noise added to cloned weights
+  mutation_std: 0.1      # noise added to cloned weights (was 0.02 — too small)
 
   # Diversity bonus (anti-herding)
   diversity_weight: 0.3  # λ for KL-diversity regularizer (push agents apart)

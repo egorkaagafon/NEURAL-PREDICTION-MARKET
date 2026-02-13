@@ -55,6 +55,8 @@ class AgentHead(nn.Module):
         self.num_classes = num_classes
         self.bet_temperature = bet_temperature
         self.agent_id = agent_id
+        self._feature_keep_prob = feature_keep_prob
+        self._in_dim = in_dim
 
         hid = hidden_dim or in_dim
 
@@ -97,6 +99,20 @@ class AgentHead(nn.Module):
         )
 
         self._init_weights(agent_id)
+
+    # ------------------------------------------------------------------
+    def rerandomize_mask(self, new_seed: int | None = None):
+        """Re-generate the feature mask with a fresh random seed.
+
+        Called during evolution so that the mutated agent is forced to
+        use a *different* subset of backbone features than its parent.
+        This prevents convergence to identical representations.
+        """
+        seed = new_seed if new_seed is not None else int(torch.randint(0, 2**31, (1,)).item())
+        g = torch.Generator()
+        g.manual_seed(seed)
+        mask = (torch.rand(self._in_dim, generator=g) < self._feature_keep_prob).float()
+        self.feature_mask.copy_(mask / max(self._feature_keep_prob, 1e-6))
 
     # ------------------------------------------------------------------
     def _init_weights(self, agent_id: int = 0):

@@ -161,16 +161,17 @@ class CapitalManager:
         self,
         agent_pool: nn.ModuleList,
         kill_fraction: float = 0.1,
-        mutation_std: float = 0.02,
+        mutation_std: float = 0.1,
     ) -> list[int]:
-        """Replace the worst‑performing agents with mutated copies of the best.
+        """Replace the worst-performing agents with mutated copies of the best.
 
-        This implements replicator–mutator dynamics:
+        This implements replicator-mutator dynamics:
           1. Sort agents by log_capital.
           2. Kill bottom `kill_fraction` %.
           3. Clone top `kill_fraction` % into their slots.
           4. Add Gaussian noise to cloned weights (exploration).
-          5. Reset log_capital of new agents to 0 (= capital 1.0).
+          5. Re-randomize feature mask (structural diversity).
+          6. Reset log_capital to log(0.1) — agent must prove itself.
 
         Returns
         -------
@@ -190,13 +191,22 @@ class CapitalManager:
             agent_pool[w].load_state_dict(
                 copy.deepcopy(agent_pool[b].state_dict())
             )
-            # Mutate: add noise to all parameters
+            # Mutate: add noise to all learnable parameters
             with torch.no_grad():
                 for param in agent_pool[w].parameters():
                     param.add_(torch.randn_like(param) * mutation_std)
 
-            # Reset log_capital to 0 (= capital 1.0, fresh start)
-            self.log_capital[w] = 0.0
+            # Re-randomize feature mask so the new agent sees different
+            # features than its parent — prevents convergence to identical
+            # representations.
+            if hasattr(agent_pool[w], 'rerandomize_mask'):
+                agent_pool[w].rerandomize_mask()
+
+            # Reset log_capital to log(0.1) ≈ -2.3.  The new agent starts
+            # with very low influence on market_probs and must earn its
+            # way up through good payoffs.  With decay=0.9, it recovers
+            # to ~1.0 in ~15 epochs if it performs at median.
+            self.log_capital[w] = -2.3026  # log(0.1)
 
         return worst_idx
 
