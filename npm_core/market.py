@@ -152,4 +152,5 @@ class MarketAggregator:
         agent_preds = probs.argmax(dim=-1)                          # [K, B]
         correct = (agent_preds == targets.unsqueeze(0)).float()     # [K, B]
         # BCE between bets and correctness
-        return F.binary_cross_entropy(bets, correct)
+        # Cast to float32 — binary_cross_entropy is unsafe under AMP autocast
+        return F.binary_cross_entropy(bets.float(), correct)
