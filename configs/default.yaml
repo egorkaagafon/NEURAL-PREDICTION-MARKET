@@ -8,7 +8,7 @@ device: "cuda"        # "cuda" or "cpu"
 data:
   dataset: "cifar10"   # cifar10 | cifar100 | svhn
   root: "./data"
-  batch_size: 512        # A100 can easily handle 512+ for CIFAR
+  batch_size: 1024       # A100 80GB handles 1024+ easily for CIFAR-32x32
   num_workers: 8
   augmentation: true
   persistent_workers: true   # keep workers alive between epochs
