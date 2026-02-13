@@ -142,9 +142,16 @@ def train_npm(cfg, train_loader, device, epochs=100):
                 tgt_expanded.reshape(K * B),
             )
 
+            # Bet calibration: bets should predict agent correctness
+            loss_bet_cal = market.bet_calibration_loss(
+                out["all_probs"], out["all_bets"], targets,
+            )
+            bet_cal_w = mkt.get("bet_calibration_weight", 0.2)
+
             loss = (loss_market
                     + agent_aux_w * loss_agent_aux
-                    + mkt["diversity_weight"] * loss_div)
+                    + mkt["diversity_weight"] * loss_div
+                    + bet_cal_w * loss_bet_cal)
 
             optimizer.zero_grad()
             loss.backward()

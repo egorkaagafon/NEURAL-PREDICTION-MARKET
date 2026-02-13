@@ -32,13 +32,14 @@ market:
   capital_decay: 0.9
   normalize_payoffs: true
   bet_temperature: 1.0
-  feature_keep_prob: 0.7
+  feature_keep_prob: 0.5
   evolution_enabled: true
   evolution_interval: 20
   kill_fraction: 0.1
   mutation_std: 0.1
   diversity_weight: 0.3
   agent_aux_weight: 0.3
+  bet_calibration_weight: 0.2
 # ── Training ──
 training:
   epochs: 200

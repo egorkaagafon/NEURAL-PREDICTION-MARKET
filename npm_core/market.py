@@ -127,3 +127,29 @@ class MarketAggregator:
         kl = kl.sum(dim=-1).mean()  # scalar
         # We want to maximise KL → so loss = -KL
         return -kl
+
+    # ------------------------------------------------------------------
+    @staticmethod
+    def bet_calibration_loss(
+        probs: torch.Tensor,     # [K, B, C]  — agent softmax predictions
+        bets: torch.Tensor,      # [K, B]     — agent bet magnitudes (∈ (0,1))
+        targets: torch.Tensor,   # [B]        — true class labels
+    ) -> torch.Tensor:
+        """Calibrate bets: high when agent is correct, low when wrong.
+
+        L_bet = BCE(b_i, 𝟙[argmax p_i = y])
+
+        This directly trains the bet signal to be informative.
+        On easy samples: most agents correct → high bets → high liquidity.
+        On hard/OOD samples: few agents correct → low bets → low liquidity.
+
+        Returns
+        -------
+        loss : scalar Tensor
+        """
+        K, B, C = probs.shape
+        # Which agents got the right answer?
+        agent_preds = probs.argmax(dim=-1)                          # [K, B]
+        correct = (agent_preds == targets.unsqueeze(0)).float()     # [K, B]
+        # BCE between bets and correctness
+        return F.binary_cross_entropy(bets, correct)

@@ -157,6 +157,7 @@ def train(cfg: dict):
     market = MarketAggregator()
     diversity_w = mkt["diversity_weight"]
     agent_aux_w = mkt.get("agent_aux_weight", 0.3)  # per-agent auxiliary loss weight
+    bet_cal_w = mkt.get("bet_calibration_weight", 0.2)  # bet calibration loss weight
     grad_clip = cfg["training"]["gradient_clip"]
 
     global_step = 0
@@ -199,9 +200,16 @@ def train(cfg: dict):
 
                 # Diversity regularizer (anti‑herding)
                 loss_div = market.diversity_loss(out["all_probs"])
+
+                # Bet calibration: train bets to predict agent correctness
+                loss_bet_cal = market.bet_calibration_loss(
+                    out["all_probs"], out["all_bets"], targets,
+                )
+
                 loss = (loss_market
                         + agent_aux_w * loss_agent_aux
-                        + diversity_w * loss_div)
+                        + diversity_w * loss_div
+                        + bet_cal_w * loss_bet_cal)
 
             # ── Backprop (with GradScaler for fp16, no-op for bf16) ──
             optimizer.zero_grad(set_to_none=True)
