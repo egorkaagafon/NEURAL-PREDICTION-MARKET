@@ -3,8 +3,10 @@
 #  run_all.sh — Full research pipeline (all 3 phases)
 #
 #  Usage:
-#    bash scripts/run_all.sh              # full run (200 epochs)
-#    bash scripts/run_all.sh --quick      # quick test (20 epochs)
+#    bash scripts/run_all.sh                          # full run (200 epochs)
+#    bash scripts/run_all.sh --quick                  # quick test (20 epochs)
+#    bash scripts/run_all.sh --skip=ensemble          # skip deep ensemble
+#    bash scripts/run_all.sh --quick --skip="ensemble mc_dropout"
 #
 #  Expected total time (on 1× A100):
 #    --quick  : ~30 min
@@ -14,11 +16,14 @@ set -e
 
 EPOCHS=200
 DEVICE="cuda"
+SKIP=""
 
-if [[ "$1" == "--quick" ]]; then
-    EPOCHS=20
-    echo "⚡ Quick mode: ${EPOCHS} epochs"
-fi
+for arg in "$@"; do
+    case "$arg" in
+        --quick)  EPOCHS=20; echo "⚡ Quick mode: ${EPOCHS} epochs" ;;
+        --skip=*) SKIP="${arg#--skip=}"; echo "⏭  Skip: ${SKIP}" ;;
+    esac
+done
 
 echo "Device: ${DEVICE}, Epochs: ${EPOCHS}"
 echo ""
@@ -32,7 +37,8 @@ echo "════════════════════════�
 uv run python experiments/run_phase1.py \
     --config configs/default.yaml \
     --epochs "${EPOCHS}" \
-    --device "${DEVICE}"
+    --device "${DEVICE}" \
+    ${SKIP:+--skip $SKIP}
 
 echo ""
 echo "→ Results: results/phase1_results.json"
