@@ -210,7 +210,9 @@ def main():
     print("\n" + "="*60)
     print("Training NPM")
     print("="*60)
+    t0 = time.perf_counter()
     npm_model, capital_mgr = train_npm(cfg, train_loader, device, args.epochs)
+    npm_train_time = time.perf_counter() - t0
 
     npm_eval = full_evaluation(npm_model, test_loader, capital_mgr, device)
     npm_sr = selective_risk_curve(
@@ -223,6 +225,7 @@ def main():
         "brier": npm_eval["brier"],
         "ece": npm_eval["ece"],
         "aurc": npm_sr["aurc"],
+        "train_time_s": round(npm_train_time, 1),
     }
     print(f"NPM: {results['npm']}")
 
@@ -235,6 +238,7 @@ def main():
     print(f"  Ensemble params: {ens_params:,}")
 
     # Train each member independently (proper Ensemble protocol)
+    t0 = time.perf_counter()
     for mi in range(ensemble.num_members):
         member = ensemble.members[mi]
         opt_m = torch.optim.AdamW(member.parameters(), lr=3e-4, weight_decay=0.05)
@@ -259,6 +263,7 @@ def main():
             if epoch % 10 == 0:
                 print(f"  [Ens member {mi}] Epoch {epoch:3d}  "
                       f"loss={total_loss/total:.4f}  acc={correct/total:.2%}")
+    ens_train_time = time.perf_counter() - t0
 
     # Fake capital manager for interface compatibility
     class FakeCapital:
@@ -283,7 +288,10 @@ def main():
     nll = F.nll_loss(torch.log(probs.clamp(min=1e-8)), tgts).item()
     entropy = -(probs * probs.clamp(min=1e-8).log()).sum(-1)
     sr = selective_risk_curve(probs, tgts, entropy)
-    results["ensemble"] = {"accuracy": acc, "nll": nll, "aurc": sr["aurc"]}
+    results["ensemble"] = {
+        "accuracy": acc, "nll": nll, "aurc": sr["aurc"],
+        "train_time_s": round(ens_train_time, 1),
+    }
     print(f"Ensemble: {results['ensemble']}")
 
     # ── 3. MC-Dropout ──
@@ -293,7 +301,9 @@ def main():
     mc_model = MCDropoutViT(mc_samples=10, **mc_kwargs).to(device)
     mc_params = sum(p.numel() for p in mc_model.parameters())
     print(f"  MC-Dropout params: {mc_params:,}")
+    t0 = time.perf_counter()
     train_baseline(mc_model, train_loader, device, args.epochs)
+    mc_train_time = time.perf_counter() - t0
 
     mc_model.eval()          # triggers MC multi-sample inference
     all_probs, all_targets = [], []
@@ -310,7 +320,10 @@ def main():
     nll = F.nll_loss(torch.log(probs.clamp(min=1e-8)), tgts).item()
     entropy = -(probs * probs.clamp(min=1e-8).log()).sum(-1)
     sr = selective_risk_curve(probs, tgts, entropy)
-    results["mc_dropout"] = {"accuracy": acc, "nll": nll, "aurc": sr["aurc"]}
+    results["mc_dropout"] = {
+        "accuracy": acc, "nll": nll, "aurc": sr["aurc"],
+        "train_time_s": round(mc_train_time, 1),
+    }
     print(f"MC-Dropout: {results['mc_dropout']}")
 
     # ── 4. MoE ──
@@ -323,7 +336,9 @@ def main():
     ).to(device)
     moe_params = sum(p.numel() for p in moe.parameters())
     print(f"  MoE params: {moe_params:,}")
+    t0 = time.perf_counter()
     train_baseline(moe, train_loader, device, args.epochs)
+    moe_train_time = time.perf_counter() - t0
 
     all_probs, all_targets = [], []
     with torch.no_grad():
@@ -340,7 +355,10 @@ def main():
     nll = F.nll_loss(torch.log(probs.clamp(min=1e-8)), tgts).item()
     entropy = -(probs * probs.clamp(min=1e-8).log()).sum(-1)
     sr = selective_risk_curve(probs, tgts, entropy)
-    results["moe"] = {"accuracy": acc, "nll": nll, "aurc": sr["aurc"]}
+    results["moe"] = {
+        "accuracy": acc, "nll": nll, "aurc": sr["aurc"],
+        "train_time_s": round(moe_train_time, 1),
+    }
     print(f"MoE: {results['moe']}")
 
     # ── Summary ──
@@ -348,8 +366,9 @@ def main():
     print("PHASE 1 RESULTS")
     print("="*60)
     for name, r in results.items():
+        t = r.get('train_time_s', 0)
         print(f"  {name:15s}: acc={r['accuracy']:.2%}  nll={r['nll']:.4f}  "
-              f"aurc={r['aurc']:.4f}")
+              f"aurc={r['aurc']:.4f}  time={t:.0f}s")
 
     out_path = Path("results")
     out_path.mkdir(exist_ok=True)
