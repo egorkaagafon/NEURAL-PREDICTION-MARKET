@@ -250,6 +250,14 @@ def main():
         npm_eval["probs"], npm_eval["targets"],
         npm_eval["uncertainty"]["market_unc"],
     )
+    npm_sr_predvar = selective_risk_curve(
+        npm_eval["probs"], npm_eval["targets"],
+        npm_eval["uncertainty"]["pred_variance"],
+    )
+    npm_sr_mi = selective_risk_curve(
+        npm_eval["probs"], npm_eval["targets"],
+        npm_eval["uncertainty"]["mutual_info"],
+    )
     results["npm"] = {
         "accuracy": npm_eval["accuracy"],
         "nll": npm_eval["nll"],
@@ -258,6 +266,8 @@ def main():
         "aurc_epistemic": npm_sr_epist["aurc"],
         "aurc_entropy": npm_sr_entropy["aurc"],
         "aurc_market": npm_sr_market["aurc"],
+        "aurc_pred_var": npm_sr_predvar["aurc"],
+        "aurc_mutual_info": npm_sr_mi["aurc"],
         "train_time_s": round(npm_train_time, 1),
     }
     print(f"NPM: {results['npm']}")
@@ -406,7 +416,9 @@ def main():
         extra = ""
         if 'aurc_market' in r:
             extra = (f"  aurc_market={r['aurc_market']:.4f}"
-                     f"  aurc_epist={r['aurc_epistemic']:.4f}")
+                     f"  aurc_epist={r['aurc_epistemic']:.4f}"
+                     f"  aurc_pvar={r['aurc_pred_var']:.4f}"
+                     f"  aurc_mi={r['aurc_mutual_info']:.4f}")
         print(f"  {name:15s}: acc={r['accuracy']:.2%}  nll={r['nll']:.4f}  "
               f"brier={brier:.4f}  ece={ece:.4f}  aurc={aurc_e:.4f}{extra}  "
               f"time={t:.0f}s")

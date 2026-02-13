@@ -223,26 +223,38 @@ def uncertainty_report(
         gini            : [B]  — capital concentration per sample
         entropy_market  : [B]  — Shannon entropy of market prediction
         market_unc      : [B]  — combined: epistemic × entropy (NPM‑native)
+        pred_variance   : [B]  — capital‑weighted prediction variance (disagreement)
+        mutual_info     : [B]  — H(market) − Σ w_i·H(agent_i) (epistemic MI)
     """
     liq = market_liquidity(bets, capital)
     epi = liquidity_uncertainty(bets, capital, running_liquidity_mean)
     herd = herding_score(probs, bets, capital)
 
-    w = agent_influence_weights(bets, capital)
+    w = agent_influence_weights(bets, capital)   # [K, B]
     gini = gini_per_sample(w)
 
-    # Market clearing price (approx — unweighted mean for speed)
-    cap = capital.view(-1, 1, 1)
-    bet = bets.unsqueeze(-1)
-    ww = cap * bet
-    mp = (ww * probs).sum(0) / ww.sum(0).clamp(min=1e-8)
-    ent = -(mp * mp.clamp(min=1e-8).log()).sum(-1)
+    # Market clearing price (capital × bet weighted)
+    cap = capital.view(-1, 1, 1)          # [K, 1, 1]
+    bet = bets.unsqueeze(-1)              # [K, B, 1]
+    ww = cap * bet                        # [K, B, 1]
+    mp = (ww * probs).sum(0) / ww.sum(0).clamp(min=1e-8)  # [B, C]
+    ent = -(mp * mp.clamp(min=1e-8).log()).sum(-1)         # [B]
+
+    # ── Capital‑weighted prediction variance ──
+    # Analogous to ensemble prediction variance: Σ w_i ||p_i − p_market||²
+    # High variance = agents disagree on class probabilities.
+    diff = probs - mp.unsqueeze(0)                      # [K, B, C]
+    sq_dist = (diff ** 2).sum(-1)                       # [K, B]
+    pred_var = (w * sq_dist).sum(0)                     # [B]
+
+    # ── Mutual information (MI) ──
+    # MI = H[E[p]] − E[H[p]]  (total − expected aleatoric)
+    # Captures how much entropy is explained by agent disagreement.
+    agent_ent = -(probs * probs.clamp(min=1e-8).log()).sum(-1)  # [K, B]
+    expected_agent_ent = (w * agent_ent).sum(0)                 # [B]
+    mutual_info = (ent - expected_agent_ent).clamp(min=0)       # [B]
 
     # Combined market uncertainty: epistemic (low liquidity) × entropy
-    # Both signals are informative but capture different phenomena:
-    #   - epi  high → agents reluctant to bet (capacity‑based)
-    #   - ent  high → prediction spread (information‑based)
-    # Product gives a stronger OOD/selective‑prediction signal.
     market_unc = epi * ent
 
     return {
@@ -252,4 +264,6 @@ def uncertainty_report(
         "gini": gini,
         "entropy_market": ent,
         "market_unc": market_unc,
+        "pred_variance": pred_var,
+        "mutual_info": mutual_info,
     }

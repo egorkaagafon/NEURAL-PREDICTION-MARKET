@@ -88,7 +88,8 @@ def main():
 
     # ── OOD Detection ──
     ood_datasets = cfg.get("evaluation", {}).get("ood_datasets", ["cifar100", "svhn"])
-    score_fns = ["epistemic_unc", "herding", "entropy_market", "market_unc"]
+    score_fns = ["epistemic_unc", "herding", "entropy_market", "market_unc",
+                  "pred_variance", "mutual_info"]
 
     for ood_name in ood_datasets:
         print(f"\n{'='*60}")
