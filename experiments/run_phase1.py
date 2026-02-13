@@ -195,6 +195,15 @@ def main():
         dropout=cfg["model"]["dropout"],
     )
 
+    # ── Parameter-matched baseline configs ──
+    # Target: ~7.5M params each (same as NPM).
+    # MC-Dropout: deeper backbone (depth=9) → 7.21M
+    mc_kwargs = dict(vit_kwargs, depth=9)
+    # Ensemble(5): 5 smaller ViTs (embed=160, depth=5, heads=8) → 7.84M
+    ens_kwargs = dict(vit_kwargs, embed_dim=160, depth=5, num_heads=8)
+    # MoE: bigger expert hidden → 6.97M
+    moe_hidden = 512
+
     results = {}
 
     # ── 1. NPM ──
@@ -219,10 +228,37 @@ def main():
 
     # ── 2. Deep Ensemble ──
     print("\n" + "="*60)
-    print("Training Deep Ensemble (5 members)")
+    print("Training Deep Ensemble (5 members, param-matched)")
     print("="*60)
-    ensemble = DeepEnsemble(num_members=5, **vit_kwargs).to(device)
-    train_baseline(ensemble, train_loader, device, args.epochs)
+    ensemble = DeepEnsemble(num_members=5, **ens_kwargs).to(device)
+    ens_params = sum(p.numel() for p in ensemble.parameters())
+    print(f"  Ensemble params: {ens_params:,}")
+
+    # Train each member independently (proper Ensemble protocol)
+    for mi in range(ensemble.num_members):
+        member = ensemble.members[mi]
+        opt_m = torch.optim.AdamW(member.parameters(), lr=3e-4, weight_decay=0.05)
+        sch_m = torch.optim.lr_scheduler.CosineAnnealingLR(opt_m, T_max=args.epochs)
+        for epoch in range(1, args.epochs + 1):
+            member.train()
+            total_loss = 0; correct = 0; total = 0
+            for images, targets in train_loader:
+                images, targets = images.to(device), targets.to(device)
+                logits = member(images)
+                probs = F.softmax(logits, dim=-1)
+                log_probs = torch.log(probs.clamp(min=1e-8))
+                loss = F.nll_loss(log_probs, targets)
+                opt_m.zero_grad(); loss.backward()
+                nn.utils.clip_grad_norm_(member.parameters(), 1.0)
+                opt_m.step()
+                pred = probs.argmax(-1)
+                correct += (pred == targets).sum().item()
+                total += targets.size(0)
+                total_loss += loss.item() * targets.size(0)
+            sch_m.step()
+            if epoch % 10 == 0:
+                print(f"  [Ens member {mi}] Epoch {epoch:3d}  "
+                      f"loss={total_loss/total:.4f}  acc={correct/total:.2%}")
 
     # Fake capital manager for interface compatibility
     class FakeCapital:
@@ -252,11 +288,14 @@ def main():
 
     # ── 3. MC-Dropout ──
     print("\n" + "="*60)
-    print("Training MC-Dropout (10 samples)")
+    print("Training MC-Dropout (10 samples, param-matched)")
     print("="*60)
-    mc_model = MCDropoutViT(mc_samples=10, **vit_kwargs).to(device)
+    mc_model = MCDropoutViT(mc_samples=10, **mc_kwargs).to(device)
+    mc_params = sum(p.numel() for p in mc_model.parameters())
+    print(f"  MC-Dropout params: {mc_params:,}")
     train_baseline(mc_model, train_loader, device, args.epochs)
 
+    mc_model.eval()          # triggers MC multi-sample inference
     all_probs, all_targets = [], []
     with torch.no_grad():
         for images, targets in test_loader:
@@ -276,11 +315,14 @@ def main():
 
     # ── 4. MoE ──
     print("\n" + "="*60)
-    print("Training MoE (16 experts, top-4)")
+    print("Training MoE (16 experts, top-4, param-matched)")
     print("="*60)
     moe = MoEClassifier(
         **vit_kwargs, num_experts=16, top_k=4,
+        expert_hidden_dim=moe_hidden,
     ).to(device)
+    moe_params = sum(p.numel() for p in moe.parameters())
+    print(f"  MoE params: {moe_params:,}")
     train_baseline(moe, train_loader, device, args.epochs)
 
     all_probs, all_targets = [], []
