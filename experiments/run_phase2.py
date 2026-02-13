@@ -22,7 +22,7 @@ from data_utils import get_cifar10_loaders, get_ood_loader
 from models.vit_npm import NeuralPredictionMarket
 from npm_core.capital import CapitalManager
 from npm_core.uncertainty import uncertainty_report, estimate_volatility
-from evaluate import ood_detection_scores, volatility_analysis
+from evaluate import ood_detection_scores, ood_detection_volatility, volatility_analysis
 
 
 def load_checkpoint(ckpt_path: str, device: torch.device):
@@ -114,29 +114,42 @@ def main():
             print(f"  {sfn:20s}  AUROC={ood_res['auroc']:.4f}  "
                   f"AUPR={ood_res['aupr']:.4f}")
 
-    # ── Volatility ──
-    print(f"\n{'='*60}")
-    print("Volatility Analysis (ID)")
-    print(f"{'='*60}")
+    # ── Volatility as OOD Detector ──
     eval_cfg = cfg.get("evaluation", {})
-    vol_id = volatility_analysis(
-        model, test_loader, capital_mgr, device,
-        eps=eval_cfg.get("volatility_eps", 0.01),
-        n_samples=eval_cfg.get("volatility_steps", 5),
-    )
-    print(f"  ID  mean_JS={vol_id['mean_js_div'].mean():.6f}  "
-          f"gini_std={vol_id['influence_gini_std'].mean():.6f}")
+    vol_eps = eval_cfg.get("volatility_eps", 0.01)
+    vol_steps = eval_cfg.get("volatility_steps", 5)
+    vol_max_batches = eval_cfg.get("volatility_max_batches", 50)
 
     for ood_name in ood_datasets:
-        ood_loader = get_ood_loader(ood_name, root=cfg["data"]["root"],
-                                    batch_size=cfg["data"]["batch_size"])
-        vol_ood = volatility_analysis(
-            model, ood_loader, capital_mgr, device,
-            eps=eval_cfg.get("volatility_eps", 0.01),
-            n_samples=eval_cfg.get("volatility_steps", 5),
+        print(f"\n{'='*60}")
+        print(f"Volatility OOD Detection: {ood_name}")
+        print(f"{'='*60}")
+
+        ood_loader = get_ood_loader(
+            ood_name, root=cfg["data"]["root"],
+            batch_size=cfg["data"]["batch_size"],
+            num_workers=cfg["data"]["num_workers"],
         )
-        print(f"  OOD({ood_name})  mean_JS={vol_ood['mean_js_div'].mean():.6f}  "
-              f"gini_std={vol_ood['influence_gini_std'].mean():.6f}")
+
+        for vkey in ["mean_js_div", "influence_gini_std"]:
+            vres = ood_detection_volatility(
+                model, test_loader, ood_loader,
+                capital_mgr, device,
+                score_key=vkey,
+                eps=vol_eps, n_samples=vol_steps,
+                max_batches=vol_max_batches,
+            )
+            tag = f"volatility_{vkey}"
+            results.setdefault(ood_name, {})[tag] = {
+                "auroc": vres["auroc"],
+                "aupr": vres["aupr"],
+                "id_mean": vres["id_mean"],
+                "ood_mean": vres["ood_mean"],
+            }
+            print(f"  {tag:30s}  AUROC={vres['auroc']:.4f}  "
+                  f"AUPR={vres['aupr']:.4f}  "
+                  f"ID_mean={vres['id_mean']:.6f}  "
+                  f"OOD_mean={vres['ood_mean']:.6f}")
 
     # ── Save ──
     out_path = Path("results")

@@ -215,7 +215,70 @@ def ood_detection_scores(
 
 
 # ══════════════════════════════════════════════════════════════════════
-#  4.  Volatility analysis (batch‑level)
+#  4.  Volatility‑based OOD detection
+# ══════════════════════════════════════════════════════════════════════
+
+@torch.no_grad()
+def ood_detection_volatility(
+    model: NeuralPredictionMarket,
+    id_loader,
+    ood_loader,
+    capital_mgr: CapitalManager,
+    device: torch.device,
+    score_key: str = "mean_js_div",
+    eps: float = 0.01,
+    n_samples: int = 5,
+    max_batches: int = 50,
+) -> dict:
+    """OOD detection using market volatility signals.
+
+    On OOD data the market is unstable under tiny perturbations:
+    JS divergence and Gini‑std spike compared to ID data.
+
+    Parameters
+    ----------
+    score_key : 'mean_js_div' or 'influence_gini_std'
+    max_batches : cap to keep runtime bounded (n_samples extra forwards each)
+    """
+    model.eval()
+    capital = capital_mgr.get_capital()
+
+    def _collect(loader):
+        scores = []
+        for i, (images, _) in enumerate(loader):
+            if i >= max_batches:
+                break
+            images = images.to(device)
+            vol = estimate_volatility(model, images, capital,
+                                      eps=eps, n_samples=n_samples)
+            scores.append(vol[score_key].cpu())
+        return torch.cat(scores)
+
+    id_scores = _collect(id_loader)
+    ood_scores = _collect(ood_loader)
+
+    labels = np.concatenate([
+        np.zeros(len(id_scores)),
+        np.ones(len(ood_scores)),
+    ])
+    scores = np.concatenate([id_scores.numpy(), ood_scores.numpy()])
+
+    auroc = roc_auc_score(labels, scores)
+    aupr = average_precision_score(labels, scores)
+
+    return {
+        "auroc": auroc,
+        "aupr": aupr,
+        "score_fn": f"volatility_{score_key}",
+        "id_scores": id_scores,
+        "ood_scores": ood_scores,
+        "id_mean": float(id_scores.mean()),
+        "ood_mean": float(ood_scores.mean()),
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  5.  Volatility analysis (batch‑level, diagnostic)
 # ══════════════════════════════════════════════════════════════════════
 
 @torch.no_grad()
