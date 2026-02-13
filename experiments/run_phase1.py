@@ -189,6 +189,8 @@ def main():
     parser.add_argument("--config", default="configs/default.yaml")
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--device", default=None)
+    parser.add_argument("--skip", nargs="*", default=[],
+                        help="Models to skip: ensemble mc_dropout moe")
     args = parser.parse_args()
 
     with open(args.config) as f:
@@ -261,133 +263,136 @@ def main():
     print(f"NPM: {results['npm']}")
 
     # ── 2. Deep Ensemble ──
-    print("\n" + "="*60)
-    print("Training Deep Ensemble (5 members, param-matched)")
-    print("="*60)
-    ensemble = DeepEnsemble(num_members=5, **ens_kwargs).to(device)
-    ens_params = sum(p.numel() for p in ensemble.parameters())
-    print(f"  Ensemble params: {ens_params:,}")
+    if "ensemble" not in args.skip:
+        print("\n" + "="*60)
+        print("Training Deep Ensemble (5 members, param-matched)")
+        print("="*60)
+        ensemble = DeepEnsemble(num_members=5, **ens_kwargs).to(device)
+        ens_params = sum(p.numel() for p in ensemble.parameters())
+        print(f"  Ensemble params: {ens_params:,}")
 
-    # Train each member independently (proper Ensemble protocol)
-    t0 = time.perf_counter()
-    for mi in range(ensemble.num_members):
-        member = ensemble.members[mi]
-        opt_m = torch.optim.AdamW(member.parameters(), lr=3e-4, weight_decay=0.05)
-        sch_m = torch.optim.lr_scheduler.CosineAnnealingLR(opt_m, T_max=args.epochs)
-        for epoch in range(1, args.epochs + 1):
-            member.train()
-            total_loss = 0; correct = 0; total = 0
-            for images, targets in train_loader:
-                images, targets = images.to(device), targets.to(device)
-                logits = member(images)
-                probs = F.softmax(logits, dim=-1)
-                log_probs = torch.log(probs.clamp(min=1e-8))
-                loss = F.nll_loss(log_probs, targets)
-                opt_m.zero_grad(); loss.backward()
-                nn.utils.clip_grad_norm_(member.parameters(), 1.0)
-                opt_m.step()
-                pred = probs.argmax(-1)
-                correct += (pred == targets).sum().item()
-                total += targets.size(0)
-                total_loss += loss.item() * targets.size(0)
-            sch_m.step()
-            if epoch % 10 == 0:
-                print(f"  [Ens member {mi}] Epoch {epoch:3d}  "
-                      f"loss={total_loss/total:.4f}  acc={correct/total:.2%}")
-    ens_train_time = time.perf_counter() - t0
+        # Train each member independently (proper Ensemble protocol)
+        t0 = time.perf_counter()
+        for mi in range(ensemble.num_members):
+            member = ensemble.members[mi]
+            opt_m = torch.optim.AdamW(member.parameters(), lr=3e-4, weight_decay=0.05)
+            sch_m = torch.optim.lr_scheduler.CosineAnnealingLR(opt_m, T_max=args.epochs)
+            for epoch in range(1, args.epochs + 1):
+                member.train()
+                total_loss = 0; correct = 0; total = 0
+                for images, targets in train_loader:
+                    images, targets = images.to(device), targets.to(device)
+                    logits = member(images)
+                    probs = F.softmax(logits, dim=-1)
+                    log_probs = torch.log(probs.clamp(min=1e-8))
+                    loss = F.nll_loss(log_probs, targets)
+                    opt_m.zero_grad(); loss.backward()
+                    nn.utils.clip_grad_norm_(member.parameters(), 1.0)
+                    opt_m.step()
+                    pred = probs.argmax(-1)
+                    correct += (pred == targets).sum().item()
+                    total += targets.size(0)
+                    total_loss += loss.item() * targets.size(0)
+                sch_m.step()
+                if epoch % 10 == 0:
+                    print(f"  [Ens member {mi}] Epoch {epoch:3d}  "
+                          f"loss={total_loss/total:.4f}  acc={correct/total:.2%}")
+        ens_train_time = time.perf_counter() - t0
 
-    # Fake capital manager for interface compatibility
-    class FakeCapital:
-        def get_capital(self):
-            return torch.ones(5, device=device)
-        def summary(self):
-            return {"gini": 0.0, "num_bankrupt": 0}
+        # Fake capital manager for interface compatibility
+        class FakeCapital:
+            def get_capital(self):
+                return torch.ones(5, device=device)
+            def summary(self):
+                return {"gini": 0.0, "num_bankrupt": 0}
 
-    # Direct evaluation for ensemble
-    ensemble.eval()
-    all_probs, all_targets = [], []
-    with torch.no_grad():
-        for images, targets in test_loader:
-            images = images.to(device)
-            out = ensemble(images)
-            all_probs.append(out["market_probs"].cpu())
-            all_targets.append(targets)
-    probs = torch.cat(all_probs)
-    tgts = torch.cat(all_targets)
-    m = _baseline_metrics(probs, tgts)
-    sr = selective_risk_curve(probs, tgts, m["entropy"])
-    results["ensemble"] = {
-        "accuracy": m["accuracy"], "nll": m["nll"],
-        "brier": m["brier"], "ece": m["ece"],
-        "aurc_entropy": sr["aurc"],
-        "train_time_s": round(ens_train_time, 1),
-    }
-    print(f"Ensemble: {results['ensemble']}")
+        # Direct evaluation for ensemble
+        ensemble.eval()
+        all_probs, all_targets = [], []
+        with torch.no_grad():
+            for images, targets in test_loader:
+                images = images.to(device)
+                out = ensemble(images)
+                all_probs.append(out["market_probs"].cpu())
+                all_targets.append(targets)
+        probs = torch.cat(all_probs)
+        tgts = torch.cat(all_targets)
+        m = _baseline_metrics(probs, tgts)
+        sr = selective_risk_curve(probs, tgts, m["entropy"])
+        results["ensemble"] = {
+            "accuracy": m["accuracy"], "nll": m["nll"],
+            "brier": m["brier"], "ece": m["ece"],
+            "aurc_entropy": sr["aurc"],
+            "train_time_s": round(ens_train_time, 1),
+        }
+        print(f"Ensemble: {results['ensemble']}")
 
     # ── 3. MC-Dropout ──
-    print("\n" + "="*60)
-    print("Training MC-Dropout (10 samples, param-matched)")
-    print("="*60)
-    mc_model = MCDropoutViT(mc_samples=10, **mc_kwargs).to(device)
-    mc_params = sum(p.numel() for p in mc_model.parameters())
-    print(f"  MC-Dropout params: {mc_params:,}")
-    t0 = time.perf_counter()
-    train_baseline(mc_model, train_loader, device, args.epochs)
-    mc_train_time = time.perf_counter() - t0
+    if "mc_dropout" not in args.skip:
+        print("\n" + "="*60)
+        print("Training MC-Dropout (10 samples, param-matched)")
+        print("="*60)
+        mc_model = MCDropoutViT(mc_samples=10, **mc_kwargs).to(device)
+        mc_params = sum(p.numel() for p in mc_model.parameters())
+        print(f"  MC-Dropout params: {mc_params:,}")
+        t0 = time.perf_counter()
+        train_baseline(mc_model, train_loader, device, args.epochs)
+        mc_train_time = time.perf_counter() - t0
 
-    mc_model.eval()          # triggers MC multi-sample inference
-    all_probs, all_targets = [], []
-    with torch.no_grad():
-        for images, targets in test_loader:
-            images = images.to(device)
-            out = mc_model(images)
-            all_probs.append(out["market_probs"].cpu())
-            all_targets.append(targets)
-    probs = torch.cat(all_probs)
-    tgts = torch.cat(all_targets)
-    m = _baseline_metrics(probs, tgts)
-    sr = selective_risk_curve(probs, tgts, m["entropy"])
-    results["mc_dropout"] = {
-        "accuracy": m["accuracy"], "nll": m["nll"],
-        "brier": m["brier"], "ece": m["ece"],
-        "aurc_entropy": sr["aurc"],
-        "train_time_s": round(mc_train_time, 1),
-    }
-    print(f"MC-Dropout: {results['mc_dropout']}")
+        mc_model.eval()          # triggers MC multi-sample inference
+        all_probs, all_targets = [], []
+        with torch.no_grad():
+            for images, targets in test_loader:
+                images = images.to(device)
+                out = mc_model(images)
+                all_probs.append(out["market_probs"].cpu())
+                all_targets.append(targets)
+        probs = torch.cat(all_probs)
+        tgts = torch.cat(all_targets)
+        m = _baseline_metrics(probs, tgts)
+        sr = selective_risk_curve(probs, tgts, m["entropy"])
+        results["mc_dropout"] = {
+            "accuracy": m["accuracy"], "nll": m["nll"],
+            "brier": m["brier"], "ece": m["ece"],
+            "aurc_entropy": sr["aurc"],
+            "train_time_s": round(mc_train_time, 1),
+        }
+        print(f"MC-Dropout: {results['mc_dropout']}")
 
     # ── 4. MoE ──
-    print("\n" + "="*60)
-    print("Training MoE (16 experts, top-4, param-matched)")
-    print("="*60)
-    moe = MoEClassifier(
-        **vit_kwargs, num_experts=16, top_k=4,
-        expert_hidden_dim=moe_hidden,
-    ).to(device)
-    moe_params = sum(p.numel() for p in moe.parameters())
-    print(f"  MoE params: {moe_params:,}")
-    t0 = time.perf_counter()
-    train_baseline(moe, train_loader, device, args.epochs)
-    moe_train_time = time.perf_counter() - t0
+    if "moe" not in args.skip:
+        print("\n" + "="*60)
+        print("Training MoE (16 experts, top-4, param-matched)")
+        print("="*60)
+        moe = MoEClassifier(
+            **vit_kwargs, num_experts=16, top_k=4,
+            expert_hidden_dim=moe_hidden,
+        ).to(device)
+        moe_params = sum(p.numel() for p in moe.parameters())
+        print(f"  MoE params: {moe_params:,}")
+        t0 = time.perf_counter()
+        train_baseline(moe, train_loader, device, args.epochs)
+        moe_train_time = time.perf_counter() - t0
 
-    all_probs, all_targets = [], []
-    with torch.no_grad():
-        moe.eval()
-        for images, targets in test_loader:
-            images = images.to(device)
-            out = moe(images)
-            all_probs.append(out["market_probs"].cpu())
-            all_targets.append(targets)
-    probs = torch.cat(all_probs)
-    tgts = torch.cat(all_targets)
-    m = _baseline_metrics(probs, tgts)
-    sr = selective_risk_curve(probs, tgts, m["entropy"])
-    results["moe"] = {
-        "accuracy": m["accuracy"], "nll": m["nll"],
-        "brier": m["brier"], "ece": m["ece"],
-        "aurc_entropy": sr["aurc"],
-        "train_time_s": round(moe_train_time, 1),
-    }
-    print(f"MoE: {results['moe']}")
+        all_probs, all_targets = [], []
+        with torch.no_grad():
+            moe.eval()
+            for images, targets in test_loader:
+                images = images.to(device)
+                out = moe(images)
+                all_probs.append(out["market_probs"].cpu())
+                all_targets.append(targets)
+        probs = torch.cat(all_probs)
+        tgts = torch.cat(all_targets)
+        m = _baseline_metrics(probs, tgts)
+        sr = selective_risk_curve(probs, tgts, m["entropy"])
+        results["moe"] = {
+            "accuracy": m["accuracy"], "nll": m["nll"],
+            "brier": m["brier"], "ece": m["ece"],
+            "aurc_entropy": sr["aurc"],
+            "train_time_s": round(moe_train_time, 1),
+        }
+        print(f"MoE: {results['moe']}")
 
     # ── Summary ──
     print("\n" + "="*60)
