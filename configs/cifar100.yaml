@@ -34,7 +34,7 @@ market:
   bet_temperature: 1.0
   feature_keep_prob: 0.7
   evolution_enabled: true
-  evolution_interval: 5
+  evolution_interval: 20
   kill_fraction: 0.1
   mutation_std: 0.02
   diversity_weight: 0.3

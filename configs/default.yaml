@@ -43,7 +43,7 @@ market:
 
   # Evolutionary selection
   evolution_enabled: true
-  evolution_interval: 5  # epochs between selection rounds (give capital time to diverge)
+  evolution_interval: 20 # epochs between selection rounds (give capital time to diverge)
   kill_fraction: 0.1     # bottom α% replaced
   mutation_std: 0.02     # noise added to cloned weights
 
