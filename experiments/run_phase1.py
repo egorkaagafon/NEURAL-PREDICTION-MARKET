@@ -28,6 +28,27 @@ from npm_core.market import MarketAggregator
 from evaluate import full_evaluation, selective_risk_curve
 
 
+def _baseline_metrics(probs: torch.Tensor, targets: torch.Tensor) -> dict:
+    """Compute accuracy, NLL, Brier, ECE, entropy for a baseline."""
+    preds = probs.argmax(-1)
+    acc = (preds == targets).float().mean().item()
+    nll = F.nll_loss(torch.log(probs.clamp(min=1e-8)), targets).item()
+    one_hot = F.one_hot(targets, num_classes=probs.shape[1]).float()
+    brier = ((probs - one_hot) ** 2).sum(-1).mean().item()
+    # ECE (15 bins)
+    confs, preds2 = probs.max(-1)
+    corrects = (preds2 == targets).float()
+    ece = 0.0
+    boundaries = torch.linspace(0, 1, 16)
+    for i in range(15):
+        mask = (confs > boundaries[i]) & (confs <= boundaries[i + 1])
+        if mask.sum() > 0:
+            ece += mask.float().mean() * (corrects[mask].mean() - confs[mask].mean()).abs()
+    ece = ece.item()
+    entropy = -(probs * probs.clamp(min=1e-8).log()).sum(-1)
+    return {"accuracy": acc, "nll": nll, "brier": brier, "ece": ece, "entropy": entropy}
+
+
 def train_baseline(model, train_loader, device, epochs=100, lr=3e-4):
     """Generic training loop for CE‑based baselines."""
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.05)
@@ -215,16 +236,21 @@ def main():
     npm_train_time = time.perf_counter() - t0
 
     npm_eval = full_evaluation(npm_model, test_loader, capital_mgr, device)
-    npm_sr = selective_risk_curve(
+    npm_sr_epist = selective_risk_curve(
         npm_eval["probs"], npm_eval["targets"],
         npm_eval["uncertainty"]["epistemic_unc"],
+    )
+    npm_sr_entropy = selective_risk_curve(
+        npm_eval["probs"], npm_eval["targets"],
+        npm_eval["uncertainty"]["entropy_market"],
     )
     results["npm"] = {
         "accuracy": npm_eval["accuracy"],
         "nll": npm_eval["nll"],
         "brier": npm_eval["brier"],
         "ece": npm_eval["ece"],
-        "aurc": npm_sr["aurc"],
+        "aurc_epistemic": npm_sr_epist["aurc"],
+        "aurc_entropy": npm_sr_entropy["aurc"],
         "train_time_s": round(npm_train_time, 1),
     }
     print(f"NPM: {results['npm']}")
@@ -283,13 +309,12 @@ def main():
             all_targets.append(targets)
     probs = torch.cat(all_probs)
     tgts = torch.cat(all_targets)
-    preds = probs.argmax(-1)
-    acc = (preds == tgts).float().mean().item()
-    nll = F.nll_loss(torch.log(probs.clamp(min=1e-8)), tgts).item()
-    entropy = -(probs * probs.clamp(min=1e-8).log()).sum(-1)
-    sr = selective_risk_curve(probs, tgts, entropy)
+    m = _baseline_metrics(probs, tgts)
+    sr = selective_risk_curve(probs, tgts, m["entropy"])
     results["ensemble"] = {
-        "accuracy": acc, "nll": nll, "aurc": sr["aurc"],
+        "accuracy": m["accuracy"], "nll": m["nll"],
+        "brier": m["brier"], "ece": m["ece"],
+        "aurc_entropy": sr["aurc"],
         "train_time_s": round(ens_train_time, 1),
     }
     print(f"Ensemble: {results['ensemble']}")
@@ -315,13 +340,12 @@ def main():
             all_targets.append(targets)
     probs = torch.cat(all_probs)
     tgts = torch.cat(all_targets)
-    preds = probs.argmax(-1)
-    acc = (preds == tgts).float().mean().item()
-    nll = F.nll_loss(torch.log(probs.clamp(min=1e-8)), tgts).item()
-    entropy = -(probs * probs.clamp(min=1e-8).log()).sum(-1)
-    sr = selective_risk_curve(probs, tgts, entropy)
+    m = _baseline_metrics(probs, tgts)
+    sr = selective_risk_curve(probs, tgts, m["entropy"])
     results["mc_dropout"] = {
-        "accuracy": acc, "nll": nll, "aurc": sr["aurc"],
+        "accuracy": m["accuracy"], "nll": m["nll"],
+        "brier": m["brier"], "ece": m["ece"],
+        "aurc_entropy": sr["aurc"],
         "train_time_s": round(mc_train_time, 1),
     }
     print(f"MC-Dropout: {results['mc_dropout']}")
@@ -350,13 +374,12 @@ def main():
             all_targets.append(targets)
     probs = torch.cat(all_probs)
     tgts = torch.cat(all_targets)
-    preds = probs.argmax(-1)
-    acc = (preds == tgts).float().mean().item()
-    nll = F.nll_loss(torch.log(probs.clamp(min=1e-8)), tgts).item()
-    entropy = -(probs * probs.clamp(min=1e-8).log()).sum(-1)
-    sr = selective_risk_curve(probs, tgts, entropy)
+    m = _baseline_metrics(probs, tgts)
+    sr = selective_risk_curve(probs, tgts, m["entropy"])
     results["moe"] = {
-        "accuracy": acc, "nll": nll, "aurc": sr["aurc"],
+        "accuracy": m["accuracy"], "nll": m["nll"],
+        "brier": m["brier"], "ece": m["ece"],
+        "aurc_entropy": sr["aurc"],
         "train_time_s": round(moe_train_time, 1),
     }
     print(f"MoE: {results['moe']}")
@@ -367,8 +390,15 @@ def main():
     print("="*60)
     for name, r in results.items():
         t = r.get('train_time_s', 0)
+        aurc_e = r.get('aurc_entropy', r.get('aurc', 0))
+        brier = r.get('brier', 0)
+        ece = r.get('ece', 0)
+        extra = ""
+        if 'aurc_epistemic' in r:
+            extra = f"  aurc_epist={r['aurc_epistemic']:.4f}"
         print(f"  {name:15s}: acc={r['accuracy']:.2%}  nll={r['nll']:.4f}  "
-              f"aurc={r['aurc']:.4f}  time={t:.0f}s")
+              f"brier={brier:.4f}  ece={ece:.4f}  aurc={aurc_e:.4f}{extra}  "
+              f"time={t:.0f}s")
 
     out_path = Path("results")
     out_path.mkdir(exist_ok=True)

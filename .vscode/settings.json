@@ -1,0 +1,8 @@
+{
+    "chat.tools.terminal.autoApprove": {
+        "/^cd /workspaces/NEURAL-PREDICTION-MARKET && python3 -c \"\nfrom models\\.baselines import MCDropoutViT, DeepEnsemble, MoEClassifier\n\n# Param-matched configs\nvit_base = dict\\(img_size=32, patch_size=4, in_channels=3, num_classes=10, embed_dim=256, depth=6, num_heads=8\\)\n\nmc = MCDropoutViT\\(mc_samples=10, \\*\\*dict\\(vit_base, depth=9\\)\\)\nmc_p = sum\\(p\\.numel\\(\\) for p in mc\\.parameters\\(\\)\\)\n\nens = DeepEnsemble\\(num_members=5, \\*\\*dict\\(vit_base, embed_dim=160, depth=5, num_heads=8\\)\\)\nens_p = sum\\(p\\.numel\\(\\) for p in ens\\.parameters\\(\\)\\)\n\nmoe = MoEClassifier\\(\\*\\*vit_base, num_experts=16, top_k=4, expert_hidden_dim=512\\)\nmoe_p = sum\\(p\\.numel\\(\\) for p in moe\\.parameters\\(\\)\\)\n\nfrom models\\.vit_npm import ViTNPM\nnpm = ViTNPM\\(\\*\\*vit_base, num_agents=16\\)\nnpm_p = sum\\(p\\.numel\\(\\) for p in npm\\.parameters\\(\\)\\)\n\nprint\\(f'NPM:        \\{npm_p:>10,\\}'\\)\nprint\\(f'MC-Dropout: \\{mc_p:>10,\\}'\\)\nprint\\(f'Ensemble:   \\{ens_p:>10,\\}'\\)\nprint\\(f'MoE:        \\{moe_p:>10,\\}'\\)\n\"\n$/": {
+            "approve": true,
+            "matchCommandLine": true
+        }
+    }
+}
