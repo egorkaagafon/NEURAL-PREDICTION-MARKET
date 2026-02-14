@@ -105,13 +105,21 @@ def get_cifar10_loaders_with_val(
         root, train=False, download=True, transform=test_transform,
     )
 
-    # Stratified split
+    # Stratified split — equal class proportions in train and val
     n = len(full_train_ds)
     n_val = int(n * val_fraction)
+    targets_arr = np.array(full_train_ds.targets)
+    classes = np.unique(targets_arr)
     rng = np.random.RandomState(seed)
-    indices = rng.permutation(n)
-    val_idx = indices[:n_val]
-    train_idx = indices[n_val:]
+
+    val_indices = []
+    for c in classes:
+        c_idx = np.where(targets_arr == c)[0]
+        rng.shuffle(c_idx)
+        n_c_val = int(len(c_idx) * val_fraction)
+        val_indices.append(c_idx[:n_c_val])
+    val_idx = np.concatenate(val_indices)
+    train_idx = np.setdiff1d(np.arange(n), val_idx)
 
     train_ds = Subset(full_train_ds, train_idx)
     val_ds = Subset(val_base_ds, val_idx)
