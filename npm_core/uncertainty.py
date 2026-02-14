@@ -222,10 +222,16 @@ def uncertainty_report(
         herding         : [B]  — consensus + concentration score
         gini            : [B]  — capital concentration per sample
         entropy_market  : [B]  — Shannon entropy of market prediction
-        market_unc      : [B]  — combined: epistemic × entropy (NPM‑native)
+        market_unc      : [B]  — combined: epistemic × entropy (product)
+        market_unc_sum  : [B]  — α·epi + (1-α)·ent_norm  (weighted sum)
+        market_unc_max  : [B]  — max(epi, ent_norm)  (best signal wins)
+        market_unc_temp : [B]  — temperature-sharpened epistemic × entropy
         pred_variance   : [B]  — capital‑weighted prediction variance (disagreement)
         mutual_info     : [B]  — H(market) − Σ w_i·H(agent_i) (epistemic MI)
     """
+    C = probs.shape[-1]
+    log_C = torch.tensor(C, dtype=probs.dtype, device=probs.device).log()
+
     liq = market_liquidity(bets, capital)
     epi = liquidity_uncertainty(bets, capital, running_liquidity_mean)
     herd = herding_score(probs, bets, capital)
@@ -241,21 +247,38 @@ def uncertainty_report(
     ent = -(mp * mp.clamp(min=1e-8).log()).sum(-1)         # [B]
 
     # ── Capital‑weighted prediction variance ──
-    # Analogous to ensemble prediction variance: Σ w_i ||p_i − p_market||²
-    # High variance = agents disagree on class probabilities.
     diff = probs - mp.unsqueeze(0)                      # [K, B, C]
     sq_dist = (diff ** 2).sum(-1)                       # [K, B]
     pred_var = (w * sq_dist).sum(0)                     # [B]
 
     # ── Mutual information (MI) ──
-    # MI = H[E[p]] − E[H[p]]  (total − expected aleatoric)
-    # Captures how much entropy is explained by agent disagreement.
     agent_ent = -(probs * probs.clamp(min=1e-8).log()).sum(-1)  # [K, B]
     expected_agent_ent = (w * agent_ent).sum(0)                 # [B]
     mutual_info = (ent - expected_agent_ent).clamp(min=0)       # [B]
 
-    # Combined market uncertainty: epistemic (low liquidity) × entropy
+    # ── Combined market uncertainty variants ──
+    # Normalise entropy to [0, 1]
+    ent_norm = ent / log_C.clamp(min=1e-8)              # [B], ∈ [0, 1]
+
+    # 1) Original product (kept for backward compat)
     market_unc = epi * ent
+
+    # 2) Weighted sum: both signals in [0,1], α balances far/near OOD
+    alpha = 0.5
+    market_unc_sum = alpha * epi + (1 - alpha) * ent_norm   # [B]
+
+    # 3) Max: whichever signal fires strongest wins
+    market_unc_max = torch.max(epi, ent_norm)               # [B]
+
+    # 4) Temperature-scaled bets → sharper epistemic signal
+    #    Compute logit(bet) / T  then re-sigmoid → more extreme bets
+    #    T < 1 sharpens: confident agents keep betting, uncertain agents → 0
+    T = 0.5
+    bets_clamped = bets.clamp(1e-6, 1 - 1e-6)
+    bet_logits = torch.log(bets_clamped / (1 - bets_clamped))   # [K, B]
+    bets_sharp = torch.sigmoid(bet_logits / T)                  # [K, B]
+    epi_temp = liquidity_uncertainty(bets_sharp, capital, running_liquidity_mean)
+    market_unc_temp = epi_temp * ent                             # [B]
 
     return {
         "liquidity": liq,
@@ -264,6 +287,9 @@ def uncertainty_report(
         "gini": gini,
         "entropy_market": ent,
         "market_unc": market_unc,
+        "market_unc_sum": market_unc_sum,
+        "market_unc_max": market_unc_max,
+        "market_unc_temp": market_unc_temp,
         "pred_variance": pred_var,
         "mutual_info": mutual_info,
     }

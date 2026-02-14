@@ -268,6 +268,18 @@ def main():
         npm_eval["probs"], npm_eval["targets"],
         npm_eval["uncertainty"]["market_unc"],
     )
+    npm_sr_market_sum = selective_risk_curve(
+        npm_eval["probs"], npm_eval["targets"],
+        npm_eval["uncertainty"]["market_unc_sum"],
+    )
+    npm_sr_market_max = selective_risk_curve(
+        npm_eval["probs"], npm_eval["targets"],
+        npm_eval["uncertainty"]["market_unc_max"],
+    )
+    npm_sr_market_temp = selective_risk_curve(
+        npm_eval["probs"], npm_eval["targets"],
+        npm_eval["uncertainty"]["market_unc_temp"],
+    )
     npm_sr_predvar = selective_risk_curve(
         npm_eval["probs"], npm_eval["targets"],
         npm_eval["uncertainty"]["pred_variance"],
@@ -284,6 +296,9 @@ def main():
         "aurc_epistemic": npm_sr_epist["aurc"],
         "aurc_entropy": npm_sr_entropy["aurc"],
         "aurc_market": npm_sr_market["aurc"],
+        "aurc_market_sum": npm_sr_market_sum["aurc"],
+        "aurc_market_max": npm_sr_market_max["aurc"],
+        "aurc_market_temp": npm_sr_market_temp["aurc"],
         "aurc_pred_var": npm_sr_predvar["aurc"],
         "aurc_mutual_info": npm_sr_mi["aurc"],
         "train_time_s": round(npm_train_time, 1),
@@ -292,6 +307,7 @@ def main():
     # NPM OOD detection
     npm_ood = {}
     npm_score_fns = ["epistemic_unc", "entropy_market", "market_unc",
+                     "market_unc_sum", "market_unc_max", "market_unc_temp",
                      "pred_variance", "mutual_info"]
     for ood_name, ood_loader in ood_loaders.items():
         npm_ood[ood_name] = {}
@@ -476,6 +492,9 @@ def main():
         extra = ""
         if 'aurc_market' in r:
             extra = (f"  aurc_market={r['aurc_market']:.4f}"
+                     f"  aurc_sum={r.get('aurc_market_sum', 0):.4f}"
+                     f"  aurc_max={r.get('aurc_market_max', 0):.4f}"
+                     f"  aurc_temp={r.get('aurc_market_temp', 0):.4f}"
                      f"  aurc_epist={r['aurc_epistemic']:.4f}"
                      f"  aurc_pvar={r['aurc_pred_var']:.4f}"
                      f"  aurc_mi={r['aurc_mutual_info']:.4f}")

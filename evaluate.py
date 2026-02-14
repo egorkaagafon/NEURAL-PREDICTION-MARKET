@@ -48,6 +48,7 @@ def full_evaluation(
     all_unc = {
         "liquidity": [], "epistemic_unc": [], "herding": [],
         "gini": [], "entropy_market": [], "market_unc": [],
+        "market_unc_sum": [], "market_unc_max": [], "market_unc_temp": [],
         "pred_variance": [], "mutual_info": [],
     }
     all_agent_probs = []
