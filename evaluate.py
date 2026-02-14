@@ -155,7 +155,7 @@ def selective_risk_curve(
 
 
 # ══════════════════════════════════════════════════════════════════════
-#  3.  OOD Detection
+#  3.  OOD Detection (NPM — market signals)
 # ══════════════════════════════════════════════════════════════════════
 
 @torch.no_grad()
@@ -213,6 +213,86 @@ def ood_detection_scores(
         "id_scores": id_scores,
         "ood_scores": ood_scores,
     }
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  3b.  OOD Detection (baselines — entropy / MI / pred_variance)
+# ══════════════════════════════════════════════════════════════════════
+
+@torch.no_grad()
+def baseline_ood_scores(
+    model: torch.nn.Module,
+    id_loader,
+    ood_loader,
+    device: torch.device,
+    score_fns: list[str] | None = None,
+) -> dict:
+    """OOD detection AUROC/AUPR for any baseline model.
+
+    Works with DeepEnsemble, MCDropoutViT, MoEClassifier — anything
+    that returns ``{"market_probs": [B,C], "all_probs": [M,B,C]}``.
+
+    Available score functions:
+        'entropy'       — Shannon entropy of mean prediction
+        'pred_variance' — mean per-class variance across members
+        'mutual_info'   — H[E[p]] - E[H[p]]  (epistemic MI)
+
+    Returns
+    -------
+    dict : {score_fn: {"auroc": float, "aupr": float}}
+    """
+    if score_fns is None:
+        score_fns = ["entropy", "pred_variance", "mutual_info"]
+
+    model.eval()
+
+    def _compute_scores(loader):
+        all_scores = {k: [] for k in score_fns}
+        for images, _ in loader:
+            images = images.to(device)
+            out = model(images)
+            mp = out["market_probs"]                          # [B, C]
+            ap = out.get("all_probs")                         # [M, B, C] or None
+
+            if "entropy" in score_fns:
+                ent = -(mp * mp.clamp(min=1e-8).log()).sum(-1)  # [B]
+                all_scores["entropy"].append(ent.cpu())
+
+            if ap is not None and ap.shape[0] > 1:
+                if "pred_variance" in score_fns:
+                    var = ((ap - mp.unsqueeze(0)) ** 2).sum(-1).mean(0)  # [B]
+                    all_scores["pred_variance"].append(var.cpu())
+                if "mutual_info" in score_fns:
+                    total_ent = -(mp * mp.clamp(min=1e-8).log()).sum(-1)
+                    member_ent = -(ap * ap.clamp(min=1e-8).log()).sum(-1)  # [M,B]
+                    mi = (total_ent - member_ent.mean(0)).clamp(min=0)
+                    all_scores["mutual_info"].append(mi.cpu())
+            else:
+                # Single-member model — MI and pred_var are zero
+                B = mp.shape[0]
+                if "pred_variance" in score_fns:
+                    all_scores["pred_variance"].append(torch.zeros(B))
+                if "mutual_info" in score_fns:
+                    all_scores["mutual_info"].append(torch.zeros(B))
+
+        return {k: torch.cat(v) for k, v in all_scores.items() if v}
+
+    id_all = _compute_scores(id_loader)
+    ood_all = _compute_scores(ood_loader)
+
+    results = {}
+    for sfn in score_fns:
+        if sfn not in id_all:
+            continue
+        id_s = id_all[sfn].numpy()
+        ood_s = ood_all[sfn].numpy()
+        labels = np.concatenate([np.zeros(len(id_s)), np.ones(len(ood_s))])
+        scores = np.concatenate([id_s, ood_s])
+        results[sfn] = {
+            "auroc": roc_auc_score(labels, scores),
+            "aupr": average_precision_score(labels, scores),
+        }
+    return results
 
 
 # ══════════════════════════════════════════════════════════════════════

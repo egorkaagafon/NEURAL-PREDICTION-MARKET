@@ -25,7 +25,8 @@ from models.vit_npm import NeuralPredictionMarket
 from models.baselines import DeepEnsemble, MCDropoutViT, MoEClassifier
 from npm_core.capital import CapitalManager
 from npm_core.market import MarketAggregator
-from evaluate import full_evaluation, selective_risk_curve
+from evaluate import full_evaluation, selective_risk_curve, baseline_ood_scores, ood_detection_scores
+from data_utils import get_cifar10_loaders, get_ood_loader
 
 
 def _baseline_metrics(probs: torch.Tensor, targets: torch.Tensor) -> dict:
@@ -215,6 +216,16 @@ def main():
         num_workers=cfg["data"]["num_workers"],
     )
 
+    # OOD loaders for detection evaluation
+    ood_datasets = cfg.get("evaluation", {}).get("ood_datasets", ["cifar100", "svhn"])
+    ood_loaders = {}
+    for ood_name in ood_datasets:
+        ood_loaders[ood_name] = get_ood_loader(
+            ood_name, root=cfg["data"]["root"],
+            batch_size=cfg["data"]["batch_size"],
+            num_workers=cfg["data"]["num_workers"],
+        )
+
     vit_kwargs = dict(
         image_size=cfg["model"]["image_size"],
         patch_size=cfg["model"]["patch_size"],
@@ -277,6 +288,23 @@ def main():
         "aurc_mutual_info": npm_sr_mi["aurc"],
         "train_time_s": round(npm_train_time, 1),
     }
+
+    # NPM OOD detection
+    npm_ood = {}
+    npm_score_fns = ["epistemic_unc", "entropy_market", "market_unc",
+                     "pred_variance", "mutual_info"]
+    for ood_name, ood_loader in ood_loaders.items():
+        npm_ood[ood_name] = {}
+        for sfn in npm_score_fns:
+            res = ood_detection_scores(
+                npm_model, test_loader, ood_loader,
+                capital_mgr, device, score_fn=sfn,
+            )
+            npm_ood[ood_name][sfn] = {
+                "auroc": round(res["auroc"], 4),
+                "aupr": round(res["aupr"], 4),
+            }
+    results["npm"]["ood"] = npm_ood
     print(f"NPM: {results['npm']}")
 
     # ── 2. Deep Ensemble ──
@@ -342,6 +370,14 @@ def main():
             "aurc_entropy": sr["aurc"],
             "train_time_s": round(ens_train_time, 1),
         }
+
+        # Ensemble OOD detection
+        ens_ood = {}
+        for ood_name, ood_loader in ood_loaders.items():
+            ens_ood[ood_name] = baseline_ood_scores(
+                ensemble, test_loader, ood_loader, device,
+            )
+        results["ensemble"]["ood"] = ens_ood
         print(f"Ensemble: {results['ensemble']}")
 
     # ── 3. MC-Dropout ──
@@ -374,6 +410,14 @@ def main():
             "aurc_entropy": sr["aurc"],
             "train_time_s": round(mc_train_time, 1),
         }
+
+        # MC-Dropout OOD detection
+        mc_ood = {}
+        for ood_name, ood_loader in ood_loaders.items():
+            mc_ood[ood_name] = baseline_ood_scores(
+                mc_model, test_loader, ood_loader, device,
+            )
+        results["mc_dropout"]["ood"] = mc_ood
         print(f"MC-Dropout: {results['mc_dropout']}")
 
     # ── 4. MoE ──
@@ -409,11 +453,20 @@ def main():
             "aurc_entropy": sr["aurc"],
             "train_time_s": round(moe_train_time, 1),
         }
+
+        # MoE OOD detection (entropy only — single model, no MI/pred_var)
+        moe_ood = {}
+        for ood_name, ood_loader in ood_loaders.items():
+            moe_ood[ood_name] = baseline_ood_scores(
+                moe, test_loader, ood_loader, device,
+                score_fns=["entropy"],
+            )
+        results["moe"]["ood"] = moe_ood
         print(f"MoE: {results['moe']}")
 
     # ── Summary ──
     print("\n" + "="*60)
-    print("PHASE 1 RESULTS")
+    print("PHASE 1 RESULTS — ID Metrics")
     print("="*60)
     for name, r in results.items():
         t = r.get('train_time_s', 0)
@@ -429,6 +482,35 @@ def main():
         print(f"  {name:15s}: acc={r['accuracy']:.2%}  nll={r['nll']:.4f}  "
               f"brier={brier:.4f}  ece={ece:.4f}  aurc={aurc_e:.4f}{extra}  "
               f"time={t:.0f}s")
+
+    # ── OOD Summary ──
+    print("\n" + "="*60)
+    print("PHASE 1 RESULTS — OOD Detection (AUROC)")
+    print("="*60)
+    for ood_name in ood_datasets:
+        print(f"\n  --- {ood_name} ---")
+        header = f"  {'model':15s}"
+        score_keys_seen = set()
+        # Collect all score function names across models
+        for name, r in results.items():
+            if "ood" in r and ood_name in r["ood"]:
+                score_keys_seen.update(r["ood"][ood_name].keys())
+        score_keys = sorted(score_keys_seen)
+        for sk in score_keys:
+            header += f"  {sk:>14s}"
+        print(header)
+        for name, r in results.items():
+            if "ood" not in r or ood_name not in r["ood"]:
+                continue
+            row = f"  {name:15s}"
+            for sk in score_keys:
+                if sk in r["ood"][ood_name]:
+                    val = r["ood"][ood_name][sk]
+                    auroc = val["auroc"] if isinstance(val, dict) else val
+                    row += f"  {auroc:14.4f}"
+                else:
+                    row += f"  {'—':>14s}"
+            print(row)
 
     out_path = Path("results")
     out_path.mkdir(exist_ok=True)
