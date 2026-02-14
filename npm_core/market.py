@@ -152,5 +152,8 @@ class MarketAggregator:
         agent_preds = probs.argmax(dim=-1)                          # [K, B]
         correct = (agent_preds == targets.unsqueeze(0)).float()     # [K, B]
         # BCE between bets and correctness
-        # Cast to float32 — binary_cross_entropy is unsafe under AMP autocast
-        return F.binary_cross_entropy(bets.float(), correct)
+        # binary_cross_entropy is banned under AMP autocast — use logits version
+        # bets = sigmoid(logit), so logit = log(b/(1-b))
+        bets_clamped = bets.float().clamp(1e-6, 1 - 1e-6)
+        logits = torch.log(bets_clamped / (1 - bets_clamped))
+        return F.binary_cross_entropy_with_logits(logits, correct)
