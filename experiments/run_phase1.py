@@ -20,13 +20,12 @@ import torch.nn as nn
 import torch.nn.functional as F
 from tqdm import tqdm
 
-from data_utils import get_cifar10_loaders
+from data_utils import get_cifar10_loaders, get_cifar10_loaders_with_val, get_ood_loader
 from models.vit_npm import NeuralPredictionMarket
 from models.baselines import DeepEnsemble, MCDropoutViT, MoEClassifier
 from npm_core.capital import CapitalManager
 from npm_core.market import MarketAggregator
 from evaluate import full_evaluation, selective_risk_curve, baseline_ood_scores, ood_detection_scores
-from data_utils import get_cifar10_loaders, get_ood_loader
 
 
 def _baseline_metrics(probs: torch.Tensor, targets: torch.Tensor) -> dict:
@@ -50,7 +49,8 @@ def _baseline_metrics(probs: torch.Tensor, targets: torch.Tensor) -> dict:
     return {"accuracy": acc, "nll": nll, "brier": brier, "ece": ece, "entropy": entropy}
 
 
-def train_baseline(model, train_loader, device, epochs=100, lr=3e-4):
+def train_baseline(model, train_loader, device, epochs=100, lr=3e-4,
+                   val_loader=None):
     """Generic training loop for CE‑based baselines."""
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.05)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
@@ -80,13 +80,39 @@ def train_baseline(model, train_loader, device, epochs=100, lr=3e-4):
             total_loss += loss.item() * targets.size(0)
 
         scheduler.step()
+
+        # Validation
+        val_str = ""
+        if val_loader is not None and epoch % 5 == 0:
+            val_loss, val_acc = _eval_val_baseline(model, val_loader, device)
+            val_str = f"  val_loss={val_loss:.4f}  val_acc={val_acc:.2%}"
+
         if epoch % 10 == 0:
             print(f"  [Baseline] Epoch {epoch:3d}  "
                   f"loss={total_loss/total:.4f}  "
-                  f"acc={correct/total:.2%}")
+                  f"acc={correct/total:.2%}{val_str}")
 
 
-def train_npm(cfg, train_loader, device, epochs=100):
+@torch.no_grad()
+def _eval_val_baseline(model, val_loader, device):
+    """Compute val loss & accuracy for a baseline model."""
+    model.eval()
+    total_loss = 0
+    correct = 0
+    total = 0
+    for images, targets in val_loader:
+        images, targets = images.to(device), targets.to(device)
+        out = model(images)
+        probs = out["market_probs"]
+        log_probs = torch.log(probs.clamp(min=1e-8))
+        total_loss += F.nll_loss(log_probs, targets, reduction='sum').item()
+        correct += (probs.argmax(-1) == targets).sum().item()
+        total += targets.size(0)
+    model.train()
+    return total_loss / total, correct / total
+
+
+def train_npm(cfg, train_loader, device, epochs=100, val_loader=None):
     """Train NPM with capital dynamics."""
     from train import build_optimizer, build_scheduler
 
@@ -183,13 +209,40 @@ def train_npm(cfg, train_loader, device, epochs=100):
                 mutation_std=mkt["mutation_std"],
             )
 
+        # Validation
+        val_str = ""
+        if val_loader is not None and epoch % 5 == 0:
+            val_loss, val_acc = _eval_val_npm(
+                model, val_loader, capital_mgr, market, device,
+            )
+            val_str = f"  val_loss={val_loss:.4f}  val_acc={val_acc:.2%}"
+
         if epoch % 10 == 0:
             print(f"  [NPM] Epoch {epoch:3d}  "
                   f"loss={total_loss/total:.4f}  "
                   f"acc={correct/total:.2%}  "
-                  f"gini={capital_mgr.summary()['gini']:.3f}")
+                  f"gini={capital_mgr.summary()['gini']:.3f}{val_str}")
 
     return model, capital_mgr
+
+
+@torch.no_grad()
+def _eval_val_npm(model, val_loader, capital_mgr, market, device):
+    """Compute val loss & accuracy for NPM."""
+    model.eval()
+    capital = capital_mgr.get_capital()
+    total_loss = 0
+    correct = 0
+    total = 0
+    for images, targets in val_loader:
+        images, targets = images.to(device), targets.to(device)
+        out = model(images, capital)
+        loss = market.compute_market_loss(out["market_probs"], targets)
+        total_loss += loss.item() * targets.size(0)
+        correct += (out["market_probs"].argmax(-1) == targets).sum().item()
+        total += targets.size(0)
+    model.train()
+    return total_loss / total, correct / total
 
 
 def main():
@@ -210,11 +263,13 @@ def main():
     device = torch.device(cfg["device"] if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
 
-    train_loader, test_loader = get_cifar10_loaders(
+    train_loader, val_loader, test_loader = get_cifar10_loaders_with_val(
         root=cfg["data"]["root"],
         batch_size=cfg["data"]["batch_size"],
         num_workers=cfg["data"]["num_workers"],
     )
+    print(f"Data: train={len(train_loader.dataset)}  val={len(val_loader.dataset)}  "
+          f"test={len(test_loader.dataset)}")
 
     # OOD loaders for detection evaluation
     ood_datasets = cfg.get("evaluation", {}).get("ood_datasets", ["cifar100", "svhn"])
@@ -252,7 +307,8 @@ def main():
     print("Training NPM")
     print("="*60)
     t0 = time.perf_counter()
-    npm_model, capital_mgr = train_npm(cfg, train_loader, device, args.epochs)
+    npm_model, capital_mgr = train_npm(cfg, train_loader, device, args.epochs,
+                                        val_loader=val_loader)
     npm_train_time = time.perf_counter() - t0
 
     npm_eval = full_evaluation(npm_model, test_loader, capital_mgr, device)
@@ -355,9 +411,24 @@ def main():
                     total += targets.size(0)
                     total_loss += loss.item() * targets.size(0)
                 sch_m.step()
+
+                val_str = ""
+                if epoch % 5 == 0:
+                    member.eval()
+                    vl = 0; vc = 0; vt = 0
+                    with torch.no_grad():
+                        for vi, vtar in val_loader:
+                            vi, vtar = vi.to(device), vtar.to(device)
+                            vl_out = F.softmax(member(vi), dim=-1)
+                            vl += F.nll_loss(torch.log(vl_out.clamp(1e-8)), vtar, reduction='sum').item()
+                            vc += (vl_out.argmax(-1) == vtar).sum().item()
+                            vt += vtar.size(0)
+                    val_str = f"  val_loss={vl/vt:.4f}  val_acc={vc/vt:.2%}"
+                    member.train()
+
                 if epoch % 10 == 0:
                     print(f"  [Ens member {mi}] Epoch {epoch:3d}  "
-                          f"loss={total_loss/total:.4f}  acc={correct/total:.2%}")
+                          f"loss={total_loss/total:.4f}  acc={correct/total:.2%}{val_str}")
         ens_train_time = time.perf_counter() - t0
 
         # Fake capital manager for interface compatibility
@@ -405,7 +476,8 @@ def main():
         mc_params = sum(p.numel() for p in mc_model.parameters())
         print(f"  MC-Dropout params: {mc_params:,}")
         t0 = time.perf_counter()
-        train_baseline(mc_model, train_loader, device, args.epochs)
+        train_baseline(mc_model, train_loader, device, args.epochs,
+                       val_loader=val_loader)
         mc_train_time = time.perf_counter() - t0
 
         mc_model.eval()          # triggers MC multi-sample inference
@@ -448,7 +520,8 @@ def main():
         moe_params = sum(p.numel() for p in moe.parameters())
         print(f"  MoE params: {moe_params:,}")
         t0 = time.perf_counter()
-        train_baseline(moe, train_loader, device, args.epochs)
+        train_baseline(moe, train_loader, device, args.epochs,
+                       val_loader=val_loader)
         moe_train_time = time.perf_counter() - t0
 
         all_probs, all_targets = [], []

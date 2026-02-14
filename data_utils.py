@@ -4,12 +4,13 @@ Data loading utilities for CIFAR‑10, CIFAR‑100, SVHN.
 
 from __future__ import annotations
 
-from typing import Tuple
+from typing import Tuple, Optional
 
 import torch
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 import torchvision
 import torchvision.transforms as T
+import numpy as np
 
 
 def get_cifar10_loaders(
@@ -60,6 +61,77 @@ def get_cifar10_loaders(
         prefetch_factor=prefetch_factor if num_workers > 0 else None,
     )
     return train_loader, test_loader
+
+
+def get_cifar10_loaders_with_val(
+    root: str = "./data",
+    batch_size: int = 128,
+    num_workers: int = 4,
+    augmentation: bool = True,
+    val_fraction: float = 0.1,
+    seed: int = 42,
+    persistent_workers: bool = False,
+    prefetch_factor: int = 2,
+) -> Tuple[DataLoader, DataLoader, DataLoader]:
+    """CIFAR-10 train/val/test.  Val uses test transforms (no augmentation)."""
+
+    normalize = T.Normalize(
+        mean=[0.4914, 0.4822, 0.4465],
+        std=[0.2470, 0.2435, 0.2616],
+    )
+
+    if augmentation:
+        train_transform = T.Compose([
+            T.RandomCrop(32, padding=4),
+            T.RandomHorizontalFlip(),
+            T.AutoAugment(T.AutoAugmentPolicy.CIFAR10),
+            T.ToTensor(),
+            normalize,
+        ])
+    else:
+        train_transform = T.Compose([T.ToTensor(), normalize])
+
+    test_transform = T.Compose([T.ToTensor(), normalize])
+
+    # Full training set — will split into train + val
+    full_train_ds = torchvision.datasets.CIFAR10(
+        root, train=True, download=True, transform=train_transform,
+    )
+    # Same data but with test transform for val evaluation
+    val_base_ds = torchvision.datasets.CIFAR10(
+        root, train=True, download=False, transform=test_transform,
+    )
+    test_ds = torchvision.datasets.CIFAR10(
+        root, train=False, download=True, transform=test_transform,
+    )
+
+    # Stratified split
+    n = len(full_train_ds)
+    n_val = int(n * val_fraction)
+    rng = np.random.RandomState(seed)
+    indices = rng.permutation(n)
+    val_idx = indices[:n_val]
+    train_idx = indices[n_val:]
+
+    train_ds = Subset(full_train_ds, train_idx)
+    val_ds = Subset(val_base_ds, val_idx)
+
+    dl_kwargs = dict(
+        num_workers=num_workers, pin_memory=True,
+        persistent_workers=persistent_workers and num_workers > 0,
+        prefetch_factor=prefetch_factor if num_workers > 0 else None,
+    )
+
+    train_loader = DataLoader(
+        train_ds, batch_size=batch_size, shuffle=True, drop_last=True, **dl_kwargs,
+    )
+    val_loader = DataLoader(
+        val_ds, batch_size=batch_size, shuffle=False, **dl_kwargs,
+    )
+    test_loader = DataLoader(
+        test_ds, batch_size=batch_size, shuffle=False, **dl_kwargs,
+    )
+    return train_loader, val_loader, test_loader
 
 
 # ── Dataset statistics ──────────────────────────────────────────────
