@@ -1,0 +1,60 @@
+# ─── Pretrained Backbone Config ───
+# Frozen pretrained ViT backbone + trainable NPM/baseline heads.
+# Clean comparison: same features, different uncertainty methods.
+
+seed: 42
+device: "cuda"
+
+# ── Data ──
+data:
+  dataset: "cifar10"
+  root: "./data"
+  batch_size: 256         # 224px images use more VRAM
+  num_workers: 8
+  image_size: 224         # resize CIFAR to match pretrained models
+  persistent_workers: true
+  prefetch_factor: 4
+
+# ── Backbone ──
+backbone:
+  name: "deit_tiny_patch16_224"   # 5.7M params, embed_dim=192
+  # alternatives: vit_small_patch16_224 (22M, embed_dim=384)
+  freeze: true
+
+# ── NPM agents ──
+model:
+  num_agents: 16
+  num_classes: 10
+  dropout: 0.1
+
+# ── Market ──
+market:
+  initial_capital: 1.0
+  capital_lr: 0.1
+  capital_decay: 0.9
+  normalize_payoffs: true
+  bet_temperature: 1.0
+  feature_keep_prob: 0.5
+  evolution_enabled: true
+  evolution_interval: 10   # can be more aggressive with frozen backbone
+  kill_fraction: 0.1
+  mutation_std: 0.1
+  diversity_weight: 0.3
+  agent_aux_weight: 0.3
+  bet_calibration_weight: 0.2
+
+# ── Training (heads only — fast) ──
+training:
+  epochs: 50              # heads converge faster on pretrained features
+  optimizer: "adamw"
+  lr: 1.0e-3              # higher LR for heads (backbone frozen)
+  weight_decay: 0.01
+  warmup_epochs: 5
+  scheduler: "cosine"
+  gradient_clip: 1.0
+
+# ── Evaluation ──
+evaluation:
+  ood_datasets: ["cifar100", "svhn"]
+  volatility_eps: 0.05
+  volatility_steps: 10
