@@ -9,11 +9,11 @@ device: "cuda"
 data:
   dataset: "cifar10"
   root: "./data"
-  batch_size: 256         # 224px images use more VRAM
-  num_workers: 8
+  batch_size: 512         # cached features are tiny → large batches OK
+  num_workers: 2          # Colab has 2 CPUs; only used for initial caching
   image_size: 224         # resize CIFAR to match pretrained models
-  persistent_workers: true
-  prefetch_factor: 4
+  persistent_workers: false
+  prefetch_factor: 2
 
 # ── Backbone ──
 backbone:

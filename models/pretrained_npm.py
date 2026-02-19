@@ -125,6 +125,31 @@ class PretrainedNPM(nn.Module):
             "market_probs": market_probs,
         }
 
+    def forward_on_features(
+        self,
+        features: torch.Tensor,
+        capital: Optional[torch.Tensor] = None,
+    ) -> dict:
+        """Forward pass on pre-extracted features (skip backbone)."""
+        all_logits, all_probs, all_bets = self.agent_pool(features)
+
+        if capital is None:
+            capital = torch.ones(self.num_agents, device=features.device)
+        else:
+            capital = capital.detach().clone()
+
+        market_probs = self.market.clearing_price(
+            all_probs, all_bets, capital,
+        )
+
+        return {
+            "features": features,
+            "all_logits": all_logits,
+            "all_probs": all_probs,
+            "all_bets": all_bets,
+            "market_probs": market_probs,
+        }
+
     def count_parameters(self, trainable_only: bool = True) -> int:
         if trainable_only:
             return sum(p.numel() for p in self.parameters() if p.requires_grad)
@@ -204,9 +229,13 @@ class PretrainedEnsemble(nn.Module):
 
     def forward(self, x: torch.Tensor) -> dict:
         features = self.backbone(x)
+        return self.forward_on_features(features)
+
+    def forward_on_features(self, features: torch.Tensor) -> dict:
+        """Forward on pre-extracted features (skip backbone)."""
+        import torch.nn.functional as F
         logits_list = [h(features) for h in self.heads]
         logits_stack = torch.stack(logits_list, dim=0)  # [M, B, C]
-        import torch.nn.functional as F
         probs_stack = F.softmax(logits_stack, dim=-1)
         mean_probs = probs_stack.mean(dim=0)
         return {
@@ -232,8 +261,12 @@ class PretrainedMCDropout(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> dict:
-        import torch.nn.functional as F
         features = self.backbone(x)
+        return self.forward_on_features(features)
+
+    def forward_on_features(self, features: torch.Tensor) -> dict:
+        """Forward on pre-extracted features (skip backbone)."""
+        import torch.nn.functional as F
 
         if self.training:
             logits = self.head(features)
@@ -281,8 +314,12 @@ class PretrainedMoE(nn.Module):
         ])
 
     def forward(self, x: torch.Tensor) -> dict:
-        import torch.nn.functional as F
         features = self.backbone(x)
+        return self.forward_on_features(features)
+
+    def forward_on_features(self, features: torch.Tensor) -> dict:
+        """Forward on pre-extracted features (skip backbone)."""
+        import torch.nn.functional as F
 
         gate_logits = self.router(features)
         gate_probs = F.softmax(gate_logits, dim=-1)
