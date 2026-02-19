@@ -335,7 +335,7 @@ def train_npm_cached(cfg, train_feats, train_targets, device, epochs,
                 if vl < best_val_loss:
                     best_val_loss = vl
                     best_state = {k: v.clone() for k, v in model.state_dict().items()}
-                    best_capital_state = capital_mgr.get_capital().clone()
+                    best_capital_state = capital_mgr.log_capital.clone()
                     wait = 0
                 else:
                     wait += 1
@@ -348,7 +348,7 @@ def train_npm_cached(cfg, train_feats, train_targets, device, epochs,
     # Restore best model if early stopping was used
     if patience > 0 and best_state is not None:
         model.load_state_dict(best_state)
-        capital_mgr._capital.data.copy_(best_capital_state)
+        capital_mgr.log_capital.data.copy_(best_capital_state)
         print(f"  [NPM] Restored best model (val_loss={best_val_loss:.4f}, "
               f"waited {wait} epochs)")
 
