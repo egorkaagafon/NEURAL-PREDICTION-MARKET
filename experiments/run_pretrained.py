@@ -66,7 +66,7 @@ def _make_cached_loader(features, targets, batch_size, shuffle=True):
     """TensorDataset on GPU → zero CPU↔GPU transfer overhead."""
     ds = TensorDataset(features, targets)
     return DataLoader(ds, batch_size=batch_size, shuffle=shuffle,
-                      num_workers=0, pin_memory=False)
+                      num_workers=0, pin_memory=False, drop_last=False)
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -206,11 +206,13 @@ def full_evaluation_baseline_cached(model, test_feats, test_targets,
 
 def train_npm_cached(cfg, train_feats, train_targets, device, epochs,
                      val_feats=None, val_targets=None):
-    """Train NPM heads on cached features with AMP."""
+    """Train NPM heads on cached features with AMP, early stopping, label smoothing."""
     mkt = cfg["market"]
     mc = cfg["model"]
     backbone_name = cfg["backbone"]["name"]
     batch_size = cfg["data"]["batch_size"]
+    label_smoothing = mc.get("label_smoothing", 0.0)
+    patience = cfg["training"].get("early_stopping_patience", 0)
 
     # Create model (backbone loaded but never used during training)
     model = PretrainedNPM(
@@ -247,11 +249,20 @@ def train_npm_cached(cfg, train_feats, train_targets, device, epochs,
     agent_aux_w = mkt.get("agent_aux_weight", 0.3)
     bet_cal_w = mkt.get("bet_calibration_weight", 0.2)
 
+    # Label smoothing CE for agent auxiliary loss
+    ce_smooth = nn.CrossEntropyLoss(label_smoothing=label_smoothing)
+
     # AMP scaler for T4
     use_amp = device.type == "cuda"
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
 
     train_loader = _make_cached_loader(train_feats, train_targets, batch_size)
+
+    # Early stopping state
+    best_val_loss = float("inf")
+    best_state = None
+    best_capital_state = None
+    wait = 0
 
     for epoch in range(1, epochs + 1):
         model.train()
@@ -267,10 +278,11 @@ def train_npm_cached(cfg, train_feats, train_targets, device, epochs,
                 loss_div = market.diversity_loss(out["all_probs"])
 
                 K, B, C = out["all_probs"].shape
-                agent_log_probs = torch.log(out["all_probs"].clamp(min=1e-8))
+                # Agent auxiliary loss with label smoothing
+                agent_logits = torch.log(out["all_probs"].clamp(min=1e-8))
                 tgt_expanded = targets.unsqueeze(0).expand(K, B)
-                loss_agent_aux = F.nll_loss(
-                    agent_log_probs.reshape(K * B, C),
+                loss_agent_aux = ce_smooth(
+                    agent_logits.reshape(K * B, C),
                     tgt_expanded.reshape(K * B),
                 )
                 loss_bet_cal = market.bet_calibration_loss(
@@ -312,24 +324,42 @@ def train_npm_cached(cfg, train_feats, train_targets, device, epochs,
             )
 
         val_str = ""
-        if val_feats is not None and epoch % 5 == 0:
+        if val_feats is not None:
             vl, va = _eval_val_npm_cached(
                 model, val_feats, val_targets, capital_mgr, market,
             )
             val_str = f"  val_loss={vl:.4f}  val_acc={va:.2%}"
+
+            # Early stopping
+            if patience > 0:
+                if vl < best_val_loss:
+                    best_val_loss = vl
+                    best_state = {k: v.clone() for k, v in model.state_dict().items()}
+                    best_capital_state = capital_mgr.get_capital().clone()
+                    wait = 0
+                else:
+                    wait += 1
 
         if epoch % 5 == 0:
             gini = capital_mgr.summary()['gini']
             print(f"  [NPM] Ep {epoch:3d}  loss={total_loss/total:.4f}  "
                   f"acc={correct/total:.2%}  gini={gini:.3f}{val_str}")
 
+    # Restore best model if early stopping was used
+    if patience > 0 and best_state is not None:
+        model.load_state_dict(best_state)
+        capital_mgr._capital.data.copy_(best_capital_state)
+        print(f"  [NPM] Restored best model (val_loss={best_val_loss:.4f}, "
+              f"waited {wait} epochs)")
+
     return model, capital_mgr
 
 
 def train_baseline_cached(model, train_feats, train_targets, device, epochs,
                           val_feats=None, val_targets=None,
-                          batch_size=512, name="Baseline"):
-    """Generic training for baseline heads on cached features with AMP."""
+                          batch_size=512, name="Baseline",
+                          label_smoothing=0.0, patience=0):
+    """Generic training for baseline heads on cached features with AMP + early stopping."""
     optimizer = torch.optim.AdamW(
         filter(lambda p: p.requires_grad, model.parameters()),
         lr=1e-3, weight_decay=0.01,
@@ -337,8 +367,13 @@ def train_baseline_cached(model, train_feats, train_targets, device, epochs,
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
     use_amp = device.type == "cuda"
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
+    ce = nn.CrossEntropyLoss(label_smoothing=label_smoothing)
 
     train_loader = _make_cached_loader(train_feats, train_targets, batch_size)
+
+    best_val_loss = float("inf")
+    best_state = None
+    wait = 0
 
     for epoch in range(1, epochs + 1):
         model.train()
@@ -348,8 +383,9 @@ def train_baseline_cached(model, train_feats, train_targets, device, epochs,
             with torch.amp.autocast("cuda", enabled=use_amp):
                 out = model.forward_on_features(feats)
                 probs = out["market_probs"]
+                # Use log-probs with label-smoothing CE
                 log_probs = torch.log(probs.clamp(min=1e-8))
-                loss = F.nll_loss(log_probs, targets)
+                loss = ce(log_probs, targets)
 
             optimizer.zero_grad(set_to_none=True)
             scaler.scale(loss).backward()
@@ -366,19 +402,33 @@ def train_baseline_cached(model, train_feats, train_targets, device, epochs,
         scheduler.step()
 
         val_str = ""
-        if val_feats is not None and epoch % 5 == 0:
+        if val_feats is not None:
             vl, va = _eval_val_baseline_cached(model, val_feats, val_targets)
             val_str = f"  val_loss={vl:.4f}  val_acc={va:.2%}"
+            if patience > 0:
+                if vl < best_val_loss:
+                    best_val_loss = vl
+                    best_state = {k: v.clone() for k, v in model.state_dict().items()}
+                    wait = 0
+                else:
+                    wait += 1
 
         if epoch % 5 == 0:
             print(f"  [{name}] Ep {epoch:3d}  loss={total_loss/total:.4f}  "
                   f"acc={correct/total:.2%}{val_str}")
 
+    if patience > 0 and best_state is not None:
+        model.load_state_dict(best_state)
+        print(f"  [{name}] Restored best model (val_loss={best_val_loss:.4f}, "
+              f"waited {wait} epochs)")
+
 
 def train_ensemble_cached(heads, train_feats, train_targets, device, epochs,
-                          batch_size=512):
+                          batch_size=512, val_feats=None, val_targets=None,
+                          label_smoothing=0.0, patience=0):
     """Train each ensemble head independently on cached features."""
     use_amp = device.type == "cuda"
+    ce = nn.CrossEntropyLoss(label_smoothing=label_smoothing)
 
     for mi, head in enumerate(heads):
         opt = torch.optim.AdamW(head.parameters(), lr=1e-3, weight_decay=0.01)
@@ -386,14 +436,18 @@ def train_ensemble_cached(heads, train_feats, train_targets, device, epochs,
         scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
         train_loader = _make_cached_loader(train_feats, train_targets, batch_size)
 
+        best_val_loss = float("inf")
+        best_state = None
+        wait = 0
+
         for epoch in range(1, epochs + 1):
             head.train()
             total_loss = 0; correct = 0; total = 0
             for feats, targets in train_loader:
                 with torch.amp.autocast("cuda", enabled=use_amp):
                     logits = head(feats)
+                    loss = ce(logits, targets)
                     probs = F.softmax(logits, dim=-1)
-                    loss = F.nll_loss(torch.log(probs.clamp(1e-8)), targets)
                 opt.zero_grad(set_to_none=True)
                 scaler.scale(loss).backward()
                 scaler.unscale_(opt)
@@ -404,9 +458,27 @@ def train_ensemble_cached(heads, train_feats, train_targets, device, epochs,
                 total += targets.size(0)
                 total_loss += loss.item() * targets.size(0)
             sch.step()
+
+            # Per-head val for early stopping
+            if val_feats is not None and patience > 0:
+                head.eval()
+                with torch.no_grad():
+                    vl_logits = head(val_feats)
+                    vl_loss = F.cross_entropy(vl_logits, val_targets).item()
+                if vl_loss < best_val_loss:
+                    best_val_loss = vl_loss
+                    best_state = {k: v.clone() for k, v in head.state_dict().items()}
+                    wait = 0
+                else:
+                    wait += 1
+
             if epoch % 10 == 0:
                 print(f"  [Ens head {mi}] Ep {epoch:3d}  "
                       f"loss={total_loss/total:.4f}  acc={correct/total:.2%}")
+
+        if patience > 0 and best_state is not None:
+            head.load_state_dict(best_state)
+            print(f"  [Ens head {mi}] Restored best (val_loss={best_val_loss:.4f})")
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -598,6 +670,9 @@ def main():
         )
 
     results = {}
+    label_smoothing = cfg["model"].get("label_smoothing", 0.0)
+    patience = cfg["training"].get("early_stopping_patience", 0)
+    bl_cfg = cfg.get("baselines", {})
 
     # ══════════════════════════════════════════════════════════════════
     #  1. Pretrained NPM
@@ -669,9 +744,14 @@ def main():
         print(f"\n{'='*60}")
         print("Training Deep Ensemble (5 heads, cached features)")
         print(f"{'='*60}")
+        ens_cfg = bl_cfg.get("ensemble", {})
         ensemble = PretrainedEnsemble(
-            shared_backbone, num_members=5,
+            shared_backbone,
+            num_members=ens_cfg.get("num_members", 5),
             num_classes=cfg["model"]["num_classes"],
+            dropout=cfg["model"].get("dropout", 0.1),
+            hidden_dim=ens_cfg.get("hidden_dim", 0),
+            num_layers=ens_cfg.get("num_layers", 1),
         ).to(device)
         trainable = sum(p.numel() for p in ensemble.parameters() if p.requires_grad)
         print(f"  Trainable: {trainable:,}")
@@ -680,6 +760,8 @@ def main():
         train_ensemble_cached(
             ensemble.heads, train_feats, train_targets, device, epochs,
             batch_size=batch_size,
+            val_feats=val_feats, val_targets=val_targets,
+            label_smoothing=label_smoothing, patience=patience,
         )
         ens_time = time.perf_counter() - t0
         print(f"  Ensemble training: {ens_time:.1f}s")
@@ -709,9 +791,14 @@ def main():
         print(f"\n{'='*60}")
         print("Training MC-Dropout (10 samples, cached features)")
         print(f"{'='*60}")
+        mc_cfg = bl_cfg.get("mc_dropout", {})
         mc_model = PretrainedMCDropout(
-            shared_backbone, mc_samples=10,
+            shared_backbone,
+            mc_samples=mc_cfg.get("mc_samples", 10),
             num_classes=cfg["model"]["num_classes"],
+            dropout=cfg["model"].get("dropout", 0.1),
+            hidden_dim=mc_cfg.get("hidden_dim", 0),
+            num_layers=mc_cfg.get("num_layers", 1),
         ).to(device)
         trainable = sum(p.numel() for p in mc_model.parameters() if p.requires_grad)
         print(f"  Trainable: {trainable:,}")
@@ -721,6 +808,7 @@ def main():
             mc_model, train_feats, train_targets, device, epochs,
             val_feats=val_feats, val_targets=val_targets,
             batch_size=batch_size, name="MC-Dropout",
+            label_smoothing=label_smoothing, patience=patience,
         )
         mc_time = time.perf_counter() - t0
         print(f"  MC-Dropout training: {mc_time:.1f}s")
@@ -750,9 +838,14 @@ def main():
         print(f"\n{'='*60}")
         print("Training MoE (16 experts, top-4, cached features)")
         print(f"{'='*60}")
+        moe_cfg = bl_cfg.get("moe", {})
         moe = PretrainedMoE(
-            shared_backbone, num_experts=16, top_k=4,
+            shared_backbone,
+            num_experts=moe_cfg.get("num_experts", 16),
+            top_k=moe_cfg.get("top_k", 4),
             num_classes=cfg["model"]["num_classes"],
+            dropout=cfg["model"].get("dropout", 0.1),
+            expert_hidden_dim=moe_cfg.get("expert_hidden_dim", 0),
         ).to(device)
         trainable = sum(p.numel() for p in moe.parameters() if p.requires_grad)
         print(f"  Trainable: {trainable:,}")
@@ -762,6 +855,7 @@ def main():
             moe, train_feats, train_targets, device, epochs,
             val_feats=val_feats, val_targets=val_targets,
             batch_size=batch_size, name="MoE",
+            label_smoothing=label_smoothing, patience=patience,
         )
         moe_time = time.perf_counter() - t0
         print(f"  MoE training: {moe_time:.1f}s")

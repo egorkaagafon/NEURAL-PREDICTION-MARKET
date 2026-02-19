@@ -357,7 +357,7 @@ def get_cifar10_loaders_224(
     )
 
     train_loader = DataLoader(
-        train_ds, batch_size=batch_size, shuffle=True, drop_last=True,
+        train_ds, batch_size=batch_size, shuffle=True, drop_last=False,
         **dl_kwargs,
     )
     test_loader = DataLoader(
@@ -427,7 +427,7 @@ def get_cifar10_loaders_224_with_val(
     )
 
     train_loader = DataLoader(
-        train_ds, batch_size=batch_size, shuffle=True, drop_last=True,
+        train_ds, batch_size=batch_size, shuffle=True, drop_last=False,
         **dl_kwargs,
     )
     val_loader = DataLoader(

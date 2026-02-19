@@ -192,18 +192,19 @@ class PretrainedBackbone(nn.Module):
 # ══════════════════════════════════════════════════════════════════════
 
 class PretrainedClassifierHead(nn.Module):
-    """Simple linear head on top of pretrained features."""
+    """Classifier head with configurable width and depth for param matching."""
 
     def __init__(self, embed_dim: int, num_classes: int = 10,
-                 dropout: float = 0.1):
+                 dropout: float = 0.1, hidden_dim: int = 0,
+                 num_layers: int = 1):
         super().__init__()
-        self.head = nn.Sequential(
-            nn.LayerNorm(embed_dim),
-            nn.Linear(embed_dim, embed_dim),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(embed_dim, num_classes),
-        )
+        hid = hidden_dim if hidden_dim > 0 else embed_dim
+        layers = [nn.LayerNorm(embed_dim), nn.Linear(embed_dim, hid),
+                  nn.GELU(), nn.Dropout(dropout)]
+        for _ in range(num_layers - 1):
+            layers += [nn.Linear(hid, hid), nn.GELU(), nn.Dropout(dropout)]
+        layers.append(nn.Linear(hid, num_classes))
+        self.head = nn.Sequential(*layers)
 
     def forward(self, features: torch.Tensor) -> torch.Tensor:
         return self.head(features)  # [B, C]
@@ -218,12 +219,15 @@ class PretrainedEnsemble(nn.Module):
 
     def __init__(self, backbone: PretrainedBackbone,
                  num_members: int = 5, num_classes: int = 10,
-                 dropout: float = 0.1):
+                 dropout: float = 0.1, hidden_dim: int = 0,
+                 num_layers: int = 1):
         super().__init__()
         self.backbone = backbone
         self.num_members = num_members
         self.heads = nn.ModuleList([
-            PretrainedClassifierHead(backbone.embed_dim, num_classes, dropout)
+            PretrainedClassifierHead(backbone.embed_dim, num_classes, dropout,
+                                     hidden_dim=hidden_dim,
+                                     num_layers=num_layers)
             for _ in range(num_members)
         ])
 
@@ -252,12 +256,14 @@ class PretrainedMCDropout(nn.Module):
 
     def __init__(self, backbone: PretrainedBackbone,
                  mc_samples: int = 10, num_classes: int = 10,
-                 dropout: float = 0.1):
+                 dropout: float = 0.1, hidden_dim: int = 0,
+                 num_layers: int = 1):
         super().__init__()
         self.backbone = backbone
         self.mc_samples = mc_samples
         self.head = PretrainedClassifierHead(
             backbone.embed_dim, num_classes, dropout,
+            hidden_dim=hidden_dim, num_layers=num_layers,
         )
 
     def forward(self, x: torch.Tensor) -> dict:
@@ -306,6 +312,9 @@ class PretrainedMoE(nn.Module):
             nn.Sequential(
                 nn.LayerNorm(embed_dim),
                 nn.Linear(embed_dim, ehid),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(ehid, ehid),
                 nn.GELU(),
                 nn.Dropout(dropout),
                 nn.Linear(ehid, num_classes),
