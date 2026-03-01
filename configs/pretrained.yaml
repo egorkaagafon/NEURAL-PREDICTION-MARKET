@@ -17,8 +17,8 @@ device: "cuda"
 data:
   dataset: "tiny_imagenet"     # Tiny ImageNet (200 classes, 64×64 → 224)
   root: "./data"
-  batch_size: 512         # cached features are tiny → large batches OK
-  num_workers: 2          # Colab has 2 CPUs; only used for initial caching
+  batch_size: 512         # default; auto-upgraded to 2048 on Ampere+ (A100/H100)
+  num_workers: 2          # default; auto-upgraded to 8 on multi-core machines
   image_size: 224         # resize to match pretrained models
   persistent_workers: false
   prefetch_factor: 2

@@ -18,11 +18,13 @@ Parameter-matching policy
   solve_ensemble_hidden_dim / solve_mc_hidden_dim / solve_moe_hidden_dim
   and logged alongside results.
 
-Optimised for T4 (Google Colab):
-  1. Feature caching: extract features ONCE, train heads on cached tensors
-     -> eliminates 224x224 resizing + backbone forward every epoch (~10x speedup)
-  2. AMP (float16): T4 has good fp16 throughput
-  3. TensorDataset on GPU: cached features stay in VRAM, zero data-loading overhead
+GPU-adaptive runtime
+  The script auto-detects the GPU family and selects optimal settings:
+    - A100/H100/A6000 (Ampere+): bf16 AMP (no GradScaler), batch 2048,
+      8 data-loader workers, torch.compile heads.
+    - T4/V100 (Turing/Volta):    fp16 AMP + GradScaler, batch 512,
+      2 workers.
+  Override batch-size / workers from CLI or config.
 
 This isolates the NPM contribution from backbone quality.
 """
@@ -79,6 +81,61 @@ from evaluate import (
     ood_detection_scores,
     baseline_ood_scores,
 )
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  GPU auto-detection  &  runtime profile
+# ══════════════════════════════════════════════════════════════════════
+
+def _detect_gpu_profile() -> dict:
+    """Return an optimal runtime config dict based on the detected GPU.
+
+    Profiles:
+      'ampere+'  — A100, A6000, H100, … (compute ≥ 8.0, bf16 native)
+      'turing'   — T4, RTX 20xx        (compute 7.5, fp16 + GradScaler)
+      'volta'    — V100                 (compute 7.0, fp16 + GradScaler)
+      'cpu'      — no GPU
+    """
+    if not torch.cuda.is_available():
+        return {
+            "tag": "cpu", "amp_dtype": None, "use_scaler": False,
+            "batch_size": 256, "num_workers": 2, "compile": False,
+        }
+
+    cap = torch.cuda.get_device_capability()
+    name = torch.cuda.get_device_name().lower()
+    vram_gb = torch.cuda.get_device_properties(0).total_mem / 1024**3
+
+    if cap >= (8, 0):  # Ampere+ (A100, A6000, H100, …)
+        return {
+            "tag": f"ampere+ ({torch.cuda.get_device_name()}, "
+                   f"{vram_gb:.0f} GB, sm_{cap[0]}{cap[1]})",
+            "amp_dtype": torch.bfloat16,  # native bf16, no loss scaling
+            "use_scaler": False,
+            "batch_size": 2048,
+            "num_workers": min(8, len(__import__('os').sched_getaffinity(0))),
+            "compile": True,
+        }
+    elif cap >= (7, 5):  # Turing (T4, RTX 2080)
+        return {
+            "tag": f"turing ({torch.cuda.get_device_name()}, "
+                   f"{vram_gb:.0f} GB, sm_{cap[0]}{cap[1]})",
+            "amp_dtype": torch.float16,
+            "use_scaler": True,
+            "batch_size": 512,
+            "num_workers": 2,
+            "compile": False,
+        }
+    else:  # Volta / older
+        return {
+            "tag": f"volta ({torch.cuda.get_device_name()}, "
+                   f"{vram_gb:.0f} GB, sm_{cap[0]}{cap[1]})",
+            "amp_dtype": torch.float16,
+            "use_scaler": True,
+            "batch_size": 512,
+            "num_workers": 2,
+            "compile": False,
+        }
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -240,8 +297,38 @@ def full_evaluation_baseline_cached(model, test_feats, test_targets,
 #  Training loops (on cached features — no backbone forward)
 # ══════════════════════════════════════════════════════════════════════
 
+def _make_amp_ctx(device, gpu_profile=None):
+    """Create AMP settings from gpu_profile.
+
+    Returns (use_amp, amp_dtype, scaler).
+    On Ampere+ uses bf16 without GradScaler; on Turing uses fp16 + scaler.
+    """
+    if gpu_profile is None:
+        gpu_profile = _detect_gpu_profile()
+    use_amp = device.type == "cuda" and gpu_profile["amp_dtype"] is not None
+    amp_dtype = gpu_profile["amp_dtype"] or torch.float16
+    use_scaler = gpu_profile["use_scaler"] and use_amp
+    scaler = torch.amp.GradScaler("cuda", enabled=use_scaler)
+    return use_amp, amp_dtype, scaler
+
+
+def _maybe_compile(model, gpu_profile=None):
+    """Apply torch.compile on Ampere+ GPUs (inductor backend).
+
+    Falls back to the original model if compile is unavailable or fails.
+    """
+    if gpu_profile is None:
+        gpu_profile = _detect_gpu_profile()
+    if not gpu_profile.get("compile"):
+        return model
+    try:
+        compiled = torch.compile(model, mode="reduce-overhead")
+        return compiled
+    except Exception:
+        return model
+
 def train_npm_cached(cfg, train_feats, train_targets, device, epochs,
-                     val_feats=None, val_targets=None):
+                     val_feats=None, val_targets=None, gpu_profile=None):
     """Train NPM heads on cached features with AMP, early stopping, label smoothing."""
     mkt = cfg["market"]
     mc = cfg["model"]
@@ -249,6 +336,8 @@ def train_npm_cached(cfg, train_feats, train_targets, device, epochs,
     batch_size = cfg["data"]["batch_size"]
     label_smoothing = mc.get("label_smoothing", 0.0)
     patience = cfg["training"].get("early_stopping_patience", 0)
+    if gpu_profile is None:
+        gpu_profile = _detect_gpu_profile()
 
     # Create model (backbone loaded but never used during training)
     model = PretrainedNPM(
@@ -281,6 +370,7 @@ def train_npm_cached(cfg, train_feats, train_targets, device, epochs,
         weight_decay=cfg["training"]["weight_decay"],
     )
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
+    model = _maybe_compile(model, gpu_profile)
     market = MarketAggregator()
     agent_aux_w = mkt.get("agent_aux_weight", 0.3)
     bet_cal_w = mkt.get("bet_calibration_weight", 0.2)
@@ -288,9 +378,8 @@ def train_npm_cached(cfg, train_feats, train_targets, device, epochs,
     # Label smoothing CE for agent auxiliary loss
     ce_smooth = nn.CrossEntropyLoss(label_smoothing=label_smoothing)
 
-    # AMP scaler for T4
-    use_amp = device.type == "cuda"
-    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
+    # AMP — adaptive per GPU profile
+    use_amp, amp_dtype, scaler = _make_amp_ctx(device, gpu_profile)
 
     train_loader = _make_cached_loader(train_feats, train_targets, batch_size)
 
@@ -307,7 +396,7 @@ def train_npm_cached(cfg, train_feats, train_targets, device, epochs,
         for feats, targets in train_loader:
             capital = capital_mgr.get_capital()
 
-            with torch.amp.autocast("cuda", enabled=use_amp):
+            with torch.amp.autocast("cuda", enabled=use_amp, dtype=amp_dtype):
                 out = model.forward_on_features(feats, capital)
 
                 loss_market = market.compute_market_loss(out["market_probs"], targets)
@@ -394,15 +483,15 @@ def train_npm_cached(cfg, train_feats, train_targets, device, epochs,
 def train_baseline_cached(model, train_feats, train_targets, device, epochs,
                           val_feats=None, val_targets=None,
                           batch_size=512, name="Baseline",
-                          label_smoothing=0.0, patience=0):
+                          label_smoothing=0.0, patience=0, gpu_profile=None):
     """Generic training for baseline heads on cached features with AMP + early stopping."""
     optimizer = torch.optim.AdamW(
         filter(lambda p: p.requires_grad, model.parameters()),
         lr=1e-3, weight_decay=0.01,
     )
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
-    use_amp = device.type == "cuda"
-    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
+    use_amp, amp_dtype, scaler = _make_amp_ctx(device, gpu_profile)
+    model = _maybe_compile(model, gpu_profile)
     ce = nn.CrossEntropyLoss(label_smoothing=label_smoothing)
 
     train_loader = _make_cached_loader(train_feats, train_targets, batch_size)
@@ -416,7 +505,7 @@ def train_baseline_cached(model, train_feats, train_targets, device, epochs,
         total_loss = 0; correct = 0; total = 0
 
         for feats, targets in train_loader:
-            with torch.amp.autocast("cuda", enabled=use_amp):
+            with torch.amp.autocast("cuda", enabled=use_amp, dtype=amp_dtype):
                 out = model.forward_on_features(feats)
                 probs = out["market_probs"]
                 # Use log-probs with label-smoothing CE
@@ -461,15 +550,16 @@ def train_baseline_cached(model, train_feats, train_targets, device, epochs,
 
 def train_ensemble_cached(heads, train_feats, train_targets, device, epochs,
                           batch_size=512, val_feats=None, val_targets=None,
-                          label_smoothing=0.0, patience=0):
+                          label_smoothing=0.0, patience=0, gpu_profile=None):
     """Train each ensemble head independently on cached features."""
-    use_amp = device.type == "cuda"
+    use_amp, amp_dtype, _ = _make_amp_ctx(device, gpu_profile)
     ce = nn.CrossEntropyLoss(label_smoothing=label_smoothing)
 
     for mi, head in enumerate(heads):
+        head = _maybe_compile(head, gpu_profile)
         opt = torch.optim.AdamW(head.parameters(), lr=1e-3, weight_decay=0.01)
         sch = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs)
-        scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
+        _, _, scaler = _make_amp_ctx(device, gpu_profile)
         train_loader = _make_cached_loader(train_feats, train_targets, batch_size)
 
         best_val_loss = float("inf")
@@ -480,7 +570,7 @@ def train_ensemble_cached(heads, train_feats, train_targets, device, epochs,
             head.train()
             total_loss = 0; correct = 0; total = 0
             for feats, targets in train_loader:
-                with torch.amp.autocast("cuda", enabled=use_amp):
+                with torch.amp.autocast("cuda", enabled=use_amp, dtype=amp_dtype):
                     logits = head(feats)
                     loss = ce(logits, targets)
                     probs = F.softmax(logits, dim=-1)
@@ -521,15 +611,16 @@ def train_ensemble_cached(heads, train_feats, train_targets, device, epochs,
 
 def train_sngp_cached(head: SNGPHead, train_feats, train_targets, device, epochs,
                       val_feats=None, val_targets=None,
-                      batch_size=512, label_smoothing=0.0, patience=0):
+                      batch_size=512, label_smoothing=0.0, patience=0,
+                      gpu_profile=None):
     """Train SNGP head: standard CE + precision matrix updates each epoch."""
     optimizer = torch.optim.AdamW(
         filter(lambda p: p.requires_grad, head.parameters()),
         lr=1e-3, weight_decay=0.01,
     )
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
-    use_amp = device.type == "cuda"
-    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
+    use_amp, amp_dtype, scaler = _make_amp_ctx(device, gpu_profile)
+    head = _maybe_compile(head, gpu_profile)
     ce = nn.CrossEntropyLoss(label_smoothing=label_smoothing)
     train_loader = _make_cached_loader(train_feats, train_targets, batch_size)
 
@@ -543,7 +634,7 @@ def train_sngp_cached(head: SNGPHead, train_feats, train_targets, device, epochs
         total_loss = 0; correct = 0; total = 0
 
         for feats, targets in train_loader:
-            with torch.amp.autocast("cuda", enabled=use_amp):
+            with torch.amp.autocast("cuda", enabled=use_amp, dtype=amp_dtype):
                 out = head.forward_on_features(feats)
                 probs = out["market_probs"]
                 log_probs = torch.log(probs.clamp(min=1e-8))
@@ -597,15 +688,15 @@ def train_sngp_cached(head: SNGPHead, train_feats, train_targets, device, epochs
 
 def train_duq_cached(head: DUQHead, train_feats, train_targets, device, epochs,
                      val_feats=None, val_targets=None,
-                     batch_size=512, patience=0):
+                     batch_size=512, patience=0, gpu_profile=None):
     """Train DUQ head: BCE on kernel values + centroid EMA + gradient penalty."""
     optimizer = torch.optim.AdamW(
         filter(lambda p: p.requires_grad, head.parameters()),
         lr=1e-3, weight_decay=0.01,
     )
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
-    use_amp = device.type == "cuda"
-    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
+    use_amp, amp_dtype, scaler = _make_amp_ctx(device, gpu_profile)
+    head = _maybe_compile(head, gpu_profile)
     train_loader = _make_cached_loader(train_feats, train_targets, batch_size)
 
     best_val_loss = float("inf")
@@ -617,7 +708,7 @@ def train_duq_cached(head: DUQHead, train_feats, train_targets, device, epochs,
         total_loss = 0; correct = 0; total = 0
 
         for feats, targets in train_loader:
-            with torch.amp.autocast("cuda", enabled=use_amp):
+            with torch.amp.autocast("cuda", enabled=use_amp, dtype=amp_dtype):
                 out = head.forward_on_features(feats)
                 kernel_vals = out["kernel_vals"]  # [B, C]
                 one_hot = F.one_hot(targets, num_classes=head.num_classes).float()
@@ -671,15 +762,15 @@ def train_duq_cached(head: DUQHead, train_feats, train_targets, device, epochs,
 
 def train_evidential_cached(head: EvidentialHead, train_feats, train_targets,
                             device, epochs, val_feats=None, val_targets=None,
-                            batch_size=512, patience=0):
+                            batch_size=512, patience=0, gpu_profile=None):
     """Train Evidential DL head: digamma loss with KL annealing."""
     optimizer = torch.optim.AdamW(
         filter(lambda p: p.requires_grad, head.parameters()),
         lr=1e-3, weight_decay=0.01,
     )
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
-    use_amp = device.type == "cuda"
-    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
+    use_amp, amp_dtype, scaler = _make_amp_ctx(device, gpu_profile)
+    head = _maybe_compile(head, gpu_profile)
     train_loader = _make_cached_loader(train_feats, train_targets, batch_size)
 
     best_val_loss = float("inf")
@@ -691,7 +782,7 @@ def train_evidential_cached(head: EvidentialHead, train_feats, train_targets,
         total_loss = 0; correct = 0; total = 0
 
         for feats, targets in train_loader:
-            with torch.amp.autocast("cuda", enabled=use_amp):
+            with torch.amp.autocast("cuda", enabled=use_amp, dtype=amp_dtype):
                 out = head.forward_on_features(feats)
                 loss = edl_digamma_loss(
                     out["alpha"], targets,
@@ -864,6 +955,10 @@ def main():
     parser.add_argument("--skip", nargs="*", default=[],
                         help="Models to skip: ensemble mc_dropout moe "
                              "sngp due duq evidential")
+    parser.add_argument("--batch-size", type=int, default=None,
+                        help="Override batch-size (default: auto per GPU)")
+    parser.add_argument("--workers", type=int, default=None,
+                        help="Override num_workers (default: auto per GPU)")
     args = parser.parse_args()
 
     with open(args.config) as f:
@@ -878,25 +973,52 @@ def main():
 
     device = torch.device(cfg["device"] if torch.cuda.is_available() else "cpu")
 
-    # T4 optimisations
+    # ── GPU-adaptive configuration ──
+    gpu_profile = _detect_gpu_profile()
+
     if device.type == "cuda":
         torch.backends.cudnn.benchmark = True
         if hasattr(torch.backends, "cuda"):
             torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
+        # Ampere+: bf16-friendly matmul precision
+        if gpu_profile["amp_dtype"] == torch.bfloat16:
+            torch.set_float32_matmul_precision("high")
+
+    # Apply GPU-optimal defaults unless user/config overrides
+    if args.batch_size is not None:
+        cfg["data"]["batch_size"] = args.batch_size
+    elif cfg["data"]["batch_size"] <= 512:
+        # Config still has default value → use GPU-optimal
+        cfg["data"]["batch_size"] = gpu_profile["batch_size"]
+
+    if args.workers is not None:
+        cfg["data"]["num_workers"] = args.workers
+    elif cfg["data"]["num_workers"] <= 2:
+        cfg["data"]["num_workers"] = gpu_profile["num_workers"]
 
     backbone_name = cfg["backbone"]["name"]
     image_size = cfg["data"].get("image_size", 224)
     batch_size = cfg["data"]["batch_size"]
     dataset_name = cfg["data"].get("dataset", "tiny_imagenet")
 
+    amp_tag = "disabled"
+    if gpu_profile["amp_dtype"] == torch.bfloat16:
+        amp_tag = "bf16 (Ampere+ native, no scaler)"
+    elif gpu_profile["amp_dtype"] == torch.float16:
+        amp_tag = "fp16 + GradScaler"
+
     print(f"{'='*60}")
-    print(f"PRETRAINED BACKBONE EXPERIMENT (T4-optimised)")
+    print(f"PRETRAINED BACKBONE EXPERIMENT")
     print(f"{'='*60}")
     print(f"Device: {device}")
+    print(f"GPU profile: {gpu_profile['tag']}")
+    print(f"AMP: {amp_tag}")
+    print(f"Batch size: {batch_size}  |  Workers: {cfg['data']['num_workers']}")
+    if gpu_profile.get("compile"):
+        print(f"torch.compile: enabled (Ampere+ inductor)")
     print(f"Backbone: {backbone_name} (frozen)")
     print(f"Dataset: {dataset_name}")
-    print(f"AMP: {'enabled' if device.type == 'cuda' else 'disabled'}")
 
     # ── Step 1: Load image data ──
     if dataset_name == "tiny_imagenet":
@@ -972,6 +1094,7 @@ def main():
     npm_model, capital_mgr = train_npm_cached(
         cfg, train_feats, train_targets, device, epochs,
         val_feats=val_feats, val_targets=val_targets,
+        gpu_profile=gpu_profile,
     )
     npm_train_time = time.perf_counter() - t0
     print(f"  NPM training: {npm_train_time:.1f}s")
@@ -1074,6 +1197,7 @@ def main():
             batch_size=batch_size,
             val_feats=val_feats, val_targets=val_targets,
             label_smoothing=label_smoothing, patience=patience,
+            gpu_profile=gpu_profile,
         )
         ens_time = time.perf_counter() - t0
         print(f"  Ensemble training: {ens_time:.1f}s")
@@ -1131,6 +1255,7 @@ def main():
             val_feats=val_feats, val_targets=val_targets,
             batch_size=batch_size, name="MC-Dropout",
             label_smoothing=label_smoothing, patience=patience,
+            gpu_profile=gpu_profile,
         )
         mc_time = time.perf_counter() - t0
         print(f"  MC-Dropout training: {mc_time:.1f}s")
@@ -1189,6 +1314,7 @@ def main():
             val_feats=val_feats, val_targets=val_targets,
             batch_size=batch_size, name="MoE",
             label_smoothing=label_smoothing, patience=patience,
+            gpu_profile=gpu_profile,
         )
         moe_time = time.perf_counter() - t0
         print(f"  MoE training: {moe_time:.1f}s")
@@ -1241,7 +1367,7 @@ def main():
             sngp_head, train_feats, train_targets, device, epochs,
             val_feats=val_feats, val_targets=val_targets,
             batch_size=batch_size, label_smoothing=label_smoothing,
-            patience=patience,
+            patience=patience, gpu_profile=gpu_profile,
         )
         sngp_time = time.perf_counter() - t0
         print(f"  SNGP training: {sngp_time:.1f}s")
@@ -1302,6 +1428,7 @@ def main():
             val_feats=val_feats, val_targets=val_targets,
             batch_size=batch_size, name="DUE",
             label_smoothing=label_smoothing, patience=patience,
+            gpu_profile=gpu_profile,
         )
         due_time = time.perf_counter() - t0
         print(f"  DUE training: {due_time:.1f}s")
@@ -1351,6 +1478,7 @@ def main():
             duq_head, train_feats, train_targets, device, epochs,
             val_feats=val_feats, val_targets=val_targets,
             batch_size=batch_size, patience=patience,
+            gpu_profile=gpu_profile,
         )
         duq_time = time.perf_counter() - t0
         print(f"  DUQ training: {duq_time:.1f}s")
@@ -1398,6 +1526,7 @@ def main():
             edl_head, train_feats, train_targets, device, epochs,
             val_feats=val_feats, val_targets=val_targets,
             batch_size=batch_size, patience=patience,
+            gpu_profile=gpu_profile,
         )
         edl_time = time.perf_counter() - t0
         print(f"  Evidential training: {edl_time:.1f}s")

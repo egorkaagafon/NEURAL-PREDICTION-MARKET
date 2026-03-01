@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Train NPM + baselines using pretrained frozen backbone (T4-optimised)
+# Train NPM + baselines using pretrained frozen backbone (auto-adapts to GPU)
 # Supports: deit_tiny_patch16_224, deit_small_patch16_224, resnet18, resnet50
 set -euo pipefail
 

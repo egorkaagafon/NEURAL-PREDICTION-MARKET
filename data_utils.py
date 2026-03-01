@@ -569,15 +569,21 @@ OOD_REGISTRY: Dict[str, dict] = {
     "cifar100": {"category": "legacy", "auto_download": True},
 }
 
-# Download URLs for OpenOOD-formatted datasets
-# These are standard curated subsets used in OpenOOD v1.5
+# Download URLs / Google Drive IDs for OpenOOD-formatted datasets.
+# Official IDs taken from https://github.com/Jingkang50/OpenOOD
+# (scripts/download/download.py  —  v1.5 branch).
 _OPENOOD_URLS = {
-    "ssb_hard":      "https://zenodo.org/records/10779810/files/ssb_hard.zip",
-    "imagenet_o":    "https://people.eecs.berkeley.edu/~hendrycks/imagenet-o.tar",
-    "inaturalist":   "https://zenodo.org/records/10779810/files/inaturalist.zip",
-    "sun":           "https://zenodo.org/records/10779810/files/sun.zip",
-    "places":        "https://zenodo.org/records/10779810/files/places.zip",
-    "textures":      "https://zenodo.org/records/10779810/files/dtd.zip",
+    # Direct HTTP links (preferred when available)
+    "imagenet_o":  "https://people.eecs.berkeley.edu/~hendrycks/imagenet-o.tar",
+}
+
+# Google-Drive file-IDs for datasets that have no stable HTTP mirror.
+_GDRIVE_IDS: dict[str, str] = {
+    "ssb_hard":    "1PzkA-WGG8Z18h0ooL_pDdz9cO-DCIouE",
+    "inaturalist": "1zfLfMvoUD0CUlKNnkk7LgxZZBnTBipdj",
+    "sun":         "1ISK0STxWzWmg-_uUr4RQ8GSLFW7TZiKp",
+    "places":      "1fZ8TbPC4JGqUCm-VtvrmkYxqRNp2PoB3",
+    "textures":    "1OSz1m3hHfVWbRdmMwKbUzoU8Hg9UKcam",
 }
 
 
@@ -593,6 +599,18 @@ def _download_file(url: str, dest: str) -> None:
 
     urllib.request.urlretrieve(url, dest, reporthook=_progress)
     print()  # newline after progress
+
+
+def _download_gdrive(file_id: str, dest: str) -> None:
+    """Download from Google Drive via *gdown*."""
+    try:
+        import gdown  # type: ignore
+    except ImportError:
+        raise RuntimeError(
+            "gdown is required for Google-Drive downloads.\n"
+            "  pip install gdown"
+        )
+    gdown.download(id=file_id, output=dest, quiet=False)
 
 
 def _extract_archive(archive_path: str, dest_dir: str) -> None:
@@ -621,16 +639,21 @@ def _download_openood_dataset(name: str, root: str) -> str:
         return dataset_dir
 
     url = _OPENOOD_URLS.get(name)
-    if url is None:
+    gdrive_id = _GDRIVE_IDS.get(name)
+    if url is None and gdrive_id is None:
         raise ValueError(
             f"No download URL for OOD dataset '{name}'. "
             f"Please download manually to {dataset_dir}/"
         )
 
     print(f"  Downloading OOD dataset: {name}")
-    ext = ".tar" if url.endswith(".tar") else ".zip"
-    archive_path = os.path.join(ood_root, f"{name}{ext}")
-    _download_file(url, archive_path)
+    if url is not None:
+        ext = ".tar" if url.endswith(".tar") else ".zip"
+        archive_path = os.path.join(ood_root, f"{name}{ext}")
+        _download_file(url, archive_path)
+    else:
+        archive_path = os.path.join(ood_root, f"{name}.zip")
+        _download_gdrive(gdrive_id, archive_path)  # type: ignore[arg-type]
 
     print(f"  Extracting {name}...")
     _extract_archive(archive_path, ood_root)
