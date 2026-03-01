@@ -1,9 +1,26 @@
-"""
-Pretrained Backbone Experiment — NPM vs Baselines on frozen ViT features.
+"""Pretrained Backbone Experiment -- NPM vs Baselines on frozen backbone features.
+
+Supported backbones (via timm):
+  ViT / DeiT : deit_tiny_patch16_224, deit_small_patch16_224, vit_small_patch16_224
+  ResNet     : resnet18, resnet50
+
+Default training dataset: Tiny ImageNet (200 classes, 64x64 -> 224x224).
+OOD evaluation:  OpenOOD v1.5 (Near-OOD: SSB-hard, ImageNet-O;
+                 Far-OOD: iNaturalist, SUN, Places, Textures).
+
+Parameter-matching policy
+  All baselines are auto-sized so that their TOTAL trainable parameter
+  count matches NPM's.  For multi-component models (Deep Ensemble, MoE)
+  the budget is divided across members/experts -- each member is therefore
+  smaller than NPM.  This eliminates the ambiguity that arises when
+  ensemble members are sized independently and the aggregate exceeds the
+  comparison model.  hidden_dim values are computed at runtime by
+  solve_ensemble_hidden_dim / solve_mc_hidden_dim / solve_moe_hidden_dim
+  and logged alongside results.
 
 Optimised for T4 (Google Colab):
-  1. Feature caching: extract 192-d features ONCE, train heads on cached tensors
-     → eliminates 224×224 resizing + backbone forward every epoch (~10× speedup)
+  1. Feature caching: extract features ONCE, train heads on cached tensors
+     -> eliminates 224x224 resizing + backbone forward every epoch (~10x speedup)
   2. AMP (float16): T4 has good fp16 throughput
   3. TensorDataset on GPU: cached features stay in VRAM, zero data-loading overhead
 
@@ -26,7 +43,10 @@ from tqdm import tqdm
 
 from data_utils import (
     get_cifar10_loaders_224_with_val,
+    get_tiny_imagenet_loaders_224_with_val,
     get_ood_loader,
+    get_all_ood_loaders,
+    OOD_REGISTRY,
 )
 from models.pretrained_npm import (
     PretrainedNPM,
@@ -34,7 +54,23 @@ from models.pretrained_npm import (
     PretrainedEnsemble,
     PretrainedMCDropout,
     PretrainedMoE,
+    BACKBONE_REGISTRY,
+    solve_ensemble_hidden_dim,
+    solve_mc_hidden_dim,
+    solve_moe_hidden_dim,
 )
+from models.uq_heads import (
+    PretrainedSNGP,
+    PretrainedDUE,
+    PretrainedDUQ,
+    PretrainedEvidential,
+    SNGPHead,
+    DUEHead,
+    DUQHead,
+    EvidentialHead,
+    edl_digamma_loss,
+)
+from models.posthoc_ood import run_all_posthoc_ood
 from npm_core.capital import CapitalManager
 from npm_core.market import MarketAggregator
 from npm_core.uncertainty import uncertainty_report
@@ -481,6 +517,228 @@ def train_ensemble_cached(heads, train_feats, train_targets, device, epochs,
             print(f"  [Ens head {mi}] Restored best (val_loss={best_val_loss:.4f})")
 
 
+# ── Specialized training loops for new UQ baselines ──
+
+def train_sngp_cached(head: SNGPHead, train_feats, train_targets, device, epochs,
+                      val_feats=None, val_targets=None,
+                      batch_size=512, label_smoothing=0.0, patience=0):
+    """Train SNGP head: standard CE + precision matrix updates each epoch."""
+    optimizer = torch.optim.AdamW(
+        filter(lambda p: p.requires_grad, head.parameters()),
+        lr=1e-3, weight_decay=0.01,
+    )
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
+    use_amp = device.type == "cuda"
+    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
+    ce = nn.CrossEntropyLoss(label_smoothing=label_smoothing)
+    train_loader = _make_cached_loader(train_feats, train_targets, batch_size)
+
+    best_val_loss = float("inf")
+    best_state = None
+    wait = 0
+
+    for epoch in range(1, epochs + 1):
+        head.train()
+        head.reset_precision()
+        total_loss = 0; correct = 0; total = 0
+
+        for feats, targets in train_loader:
+            with torch.amp.autocast("cuda", enabled=use_amp):
+                out = head.forward_on_features(feats)
+                probs = out["market_probs"]
+                log_probs = torch.log(probs.clamp(min=1e-8))
+                loss = ce(log_probs, targets)
+
+            optimizer.zero_grad(set_to_none=True)
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            nn.utils.clip_grad_norm_(head.parameters(), 1.0)
+            scaler.step(optimizer)
+            scaler.update()
+
+            # Update GP precision matrix (Laplace approx)
+            with torch.no_grad():
+                h = head.hidden(feats)
+                phi = head.rff(h)
+                head.update_precision(phi.float(), targets)
+
+            pred = probs.argmax(-1)
+            correct += (pred == targets).sum().item()
+            total += targets.size(0)
+            total_loss += loss.item() * targets.size(0)
+
+        scheduler.step()
+
+        val_str = ""
+        if val_feats is not None:
+            head.eval()
+            with torch.no_grad():
+                out_v = head.forward_on_features(val_feats)
+                vp = out_v["market_probs"]
+                vl = F.nll_loss(torch.log(vp.clamp(min=1e-8)), val_targets).item()
+                va = (vp.argmax(-1) == val_targets).float().mean().item()
+            val_str = f"  val_loss={vl:.4f}  val_acc={va:.2%}"
+            if patience > 0:
+                if vl < best_val_loss:
+                    best_val_loss = vl
+                    best_state = {k: v.clone() for k, v in head.state_dict().items()}
+                    wait = 0
+                else:
+                    wait += 1
+
+        if epoch % 5 == 0:
+            print(f"  [SNGP] Ep {epoch:3d}  loss={total_loss/total:.4f}  "
+                  f"acc={correct/total:.2%}{val_str}")
+
+    if patience > 0 and best_state is not None:
+        head.load_state_dict(best_state)
+        print(f"  [SNGP] Restored best (val_loss={best_val_loss:.4f})")
+
+
+def train_duq_cached(head: DUQHead, train_feats, train_targets, device, epochs,
+                     val_feats=None, val_targets=None,
+                     batch_size=512, patience=0):
+    """Train DUQ head: BCE on kernel values + centroid EMA + gradient penalty."""
+    optimizer = torch.optim.AdamW(
+        filter(lambda p: p.requires_grad, head.parameters()),
+        lr=1e-3, weight_decay=0.01,
+    )
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
+    use_amp = device.type == "cuda"
+    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
+    train_loader = _make_cached_loader(train_feats, train_targets, batch_size)
+
+    best_val_loss = float("inf")
+    best_state = None
+    wait = 0
+
+    for epoch in range(1, epochs + 1):
+        head.train()
+        total_loss = 0; correct = 0; total = 0
+
+        for feats, targets in train_loader:
+            with torch.amp.autocast("cuda", enabled=use_amp):
+                out = head.forward_on_features(feats)
+                kernel_vals = out["kernel_vals"]  # [B, C]
+                one_hot = F.one_hot(targets, num_classes=head.num_classes).float()
+                loss = F.binary_cross_entropy(
+                    kernel_vals.clamp(1e-6, 1 - 1e-6), one_hot,
+                )
+
+            optimizer.zero_grad(set_to_none=True)
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            nn.utils.clip_grad_norm_(head.parameters(), 1.0)
+            scaler.step(optimizer)
+            scaler.update()
+
+            # Update centroids via EMA
+            head.update_centroids(feats.detach(), targets)
+
+            probs = out["market_probs"]
+            pred = probs.argmax(-1)
+            correct += (pred == targets).sum().item()
+            total += targets.size(0)
+            total_loss += loss.item() * targets.size(0)
+
+        scheduler.step()
+
+        val_str = ""
+        if val_feats is not None:
+            head.eval()
+            with torch.no_grad():
+                out_v = head.forward_on_features(val_feats)
+                vp = out_v["market_probs"]
+                vl = F.nll_loss(torch.log(vp.clamp(min=1e-8)), val_targets).item()
+                va = (vp.argmax(-1) == val_targets).float().mean().item()
+            val_str = f"  val_loss={vl:.4f}  val_acc={va:.2%}"
+            if patience > 0:
+                if vl < best_val_loss:
+                    best_val_loss = vl
+                    best_state = {k: v.clone() for k, v in head.state_dict().items()}
+                    wait = 0
+                else:
+                    wait += 1
+
+        if epoch % 5 == 0:
+            print(f"  [DUQ] Ep {epoch:3d}  loss={total_loss/total:.4f}  "
+                  f"acc={correct/total:.2%}{val_str}")
+
+    if patience > 0 and best_state is not None:
+        head.load_state_dict(best_state)
+        print(f"  [DUQ] Restored best (val_loss={best_val_loss:.4f})")
+
+
+def train_evidential_cached(head: EvidentialHead, train_feats, train_targets,
+                            device, epochs, val_feats=None, val_targets=None,
+                            batch_size=512, patience=0):
+    """Train Evidential DL head: digamma loss with KL annealing."""
+    optimizer = torch.optim.AdamW(
+        filter(lambda p: p.requires_grad, head.parameters()),
+        lr=1e-3, weight_decay=0.01,
+    )
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
+    use_amp = device.type == "cuda"
+    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
+    train_loader = _make_cached_loader(train_feats, train_targets, batch_size)
+
+    best_val_loss = float("inf")
+    best_state = None
+    wait = 0
+
+    for epoch in range(1, epochs + 1):
+        head.train()
+        total_loss = 0; correct = 0; total = 0
+
+        for feats, targets in train_loader:
+            with torch.amp.autocast("cuda", enabled=use_amp):
+                out = head.forward_on_features(feats)
+                loss = edl_digamma_loss(
+                    out["alpha"], targets,
+                    epoch=epoch, total_epochs=epochs,
+                )
+
+            optimizer.zero_grad(set_to_none=True)
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            nn.utils.clip_grad_norm_(head.parameters(), 1.0)
+            scaler.step(optimizer)
+            scaler.update()
+
+            probs = out["market_probs"]
+            pred = probs.argmax(-1)
+            correct += (pred == targets).sum().item()
+            total += targets.size(0)
+            total_loss += loss.item() * targets.size(0)
+
+        scheduler.step()
+
+        val_str = ""
+        if val_feats is not None:
+            head.eval()
+            with torch.no_grad():
+                out_v = head.forward_on_features(val_feats)
+                vp = out_v["market_probs"]
+                vl = F.nll_loss(torch.log(vp.clamp(min=1e-8)), val_targets).item()
+                va = (vp.argmax(-1) == val_targets).float().mean().item()
+            val_str = f"  val_loss={vl:.4f}  val_acc={va:.2%}"
+            if patience > 0:
+                if vl < best_val_loss:
+                    best_val_loss = vl
+                    best_state = {k: v.clone() for k, v in head.state_dict().items()}
+                    wait = 0
+                else:
+                    wait += 1
+
+        if epoch % 5 == 0:
+            print(f"  [Evidential] Ep {epoch:3d}  loss={total_loss/total:.4f}  "
+                  f"acc={correct/total:.2%}{val_str}")
+
+    if patience > 0 and best_state is not None:
+        head.load_state_dict(best_state)
+        print(f"  [Evidential] Restored best (val_loss={best_val_loss:.4f})")
+
+
 # ══════════════════════════════════════════════════════════════════════
 #  OOD wrappers (still need backbone forward for new images)
 # ══════════════════════════════════════════════════════════════════════
@@ -600,8 +858,12 @@ def main():
     parser.add_argument("--config", default="configs/pretrained.yaml")
     parser.add_argument("--epochs", type=int, default=None)
     parser.add_argument("--device", default=None)
+    parser.add_argument("--backbone", default=None,
+                        help="Override backbone: deit_tiny_patch16_224, "
+                             "deit_small_patch16_224, resnet18, resnet50, ...")
     parser.add_argument("--skip", nargs="*", default=[],
-                        help="Models to skip: ensemble mc_dropout moe")
+                        help="Models to skip: ensemble mc_dropout moe "
+                             "sngp due duq evidential")
     args = parser.parse_args()
 
     with open(args.config) as f:
@@ -610,6 +872,8 @@ def main():
         cfg["device"] = args.device
     if args.epochs:
         cfg["training"]["epochs"] = args.epochs
+    if args.backbone:
+        cfg["backbone"]["name"] = args.backbone
     epochs = cfg["training"]["epochs"]
 
     device = torch.device(cfg["device"] if torch.cuda.is_available() else "cpu")
@@ -624,21 +888,34 @@ def main():
     backbone_name = cfg["backbone"]["name"]
     image_size = cfg["data"].get("image_size", 224)
     batch_size = cfg["data"]["batch_size"]
+    dataset_name = cfg["data"].get("dataset", "tiny_imagenet")
 
     print(f"{'='*60}")
     print(f"PRETRAINED BACKBONE EXPERIMENT (T4-optimised)")
     print(f"{'='*60}")
     print(f"Device: {device}")
     print(f"Backbone: {backbone_name} (frozen)")
+    print(f"Dataset: {dataset_name}")
     print(f"AMP: {'enabled' if device.type == 'cuda' else 'disabled'}")
 
     # ── Step 1: Load image data ──
-    train_loader, val_loader, test_loader = get_cifar10_loaders_224_with_val(
-        root=cfg["data"]["root"],
-        batch_size=batch_size,
-        num_workers=cfg["data"]["num_workers"],
-        image_size=image_size,
-    )
+    if dataset_name == "tiny_imagenet":
+        train_loader, val_loader, test_loader = get_tiny_imagenet_loaders_224_with_val(
+            root=cfg["data"]["root"],
+            batch_size=batch_size,
+            num_workers=cfg["data"]["num_workers"],
+            image_size=image_size,
+        )
+    elif dataset_name == "cifar10":
+        train_loader, val_loader, test_loader = get_cifar10_loaders_224_with_val(
+            root=cfg["data"]["root"],
+            batch_size=batch_size,
+            num_workers=cfg["data"]["num_workers"],
+            image_size=image_size,
+        )
+    else:
+        raise ValueError(f"Unsupported pretrained dataset: {dataset_name}. "
+                         f"Use 'tiny_imagenet' or 'cifar10'.")
     print(f"Data: train={len(train_loader.dataset)}  val={len(val_loader.dataset)}  "
           f"test={len(test_loader.dataset)}  image_size={image_size}")
 
@@ -658,16 +935,27 @@ def main():
           f"train: {train_feats.shape}  ({feat_mb:.1f} MB on {train_feats.device})")
     print(f"  val: {val_feats.shape}  test: {test_feats.shape}")
 
-    # OOD loaders (still need backbone forward for these)
-    ood_datasets = cfg.get("evaluation", {}).get("ood_datasets", ["cifar100", "svhn"])
-    ood_loaders = {}
-    for ood_name in ood_datasets:
-        ood_loaders[ood_name] = get_ood_loader(
-            ood_name, root=cfg["data"]["root"],
-            batch_size=batch_size,
-            num_workers=cfg["data"]["num_workers"],
-            image_size=image_size,
-        )
+    # OOD loaders (OpenOOD v1.5 protocol — still need backbone forward)
+    eval_cfg = cfg.get("evaluation", {})
+    ood_datasets = eval_cfg.get("ood_datasets",
+                                ["ssb_hard", "imagenet_o",
+                                 "inaturalist", "sun", "places", "textures"])
+    near_ood = eval_cfg.get("near_ood", ["ssb_hard", "imagenet_o"])
+    far_ood = eval_cfg.get("far_ood",
+                           ["inaturalist", "sun", "places", "textures"])
+    max_ood_samples = eval_cfg.get("max_ood_samples", 0)
+
+    print(f"\nLoading OOD datasets (OpenOOD v1.5 protocol)...")
+    print(f"  Near-OOD: {near_ood}")
+    print(f"  Far-OOD:  {far_ood}")
+    ood_loaders = get_all_ood_loaders(
+        ood_datasets,
+        root=cfg["data"]["root"],
+        batch_size=batch_size,
+        num_workers=cfg["data"]["num_workers"],
+        image_size=image_size,
+        max_samples=max_ood_samples,
+    )
 
     results = {}
     label_smoothing = cfg["model"].get("label_smoothing", 0.0)
@@ -708,6 +996,7 @@ def main():
         "nll": npm_eval["nll"],
         "brier": npm_eval["brier"],
         "ece": npm_eval["ece"],
+        "trainable_params": npm_model.count_parameters(trainable_only=True),
         "train_time_s": round(npm_train_time, 1),
     }
     for unc_key, result_key in aurc_keys:
@@ -738,23 +1027,46 @@ def main():
     print(f"\nNPM: acc={npm_results['accuracy']:.2%}  nll={npm_results['nll']:.4f}")
 
     # ══════════════════════════════════════════════════════════════════
+    #  Parameter-budget matching
+    #  All baselines are auto-sized so their TOTAL trainable param count
+    #  matches NPM's trainable params.  For ensembles / MoE the budget
+    #  is spread across members/experts (each member is smaller).
+    # ══════════════════════════════════════════════════════════════════
+    npm_trainable = npm_model.count_parameters(trainable_only=True)
+    embed_dim = shared_backbone.embed_dim
+    num_classes = cfg["model"]["num_classes"]
+
+    print(f"\n  NPM trainable param budget: {npm_trainable:,}")
+    print(f"  All baselines will be auto-sized to match this budget.")
+    results["param_budget"] = npm_trainable
+
+    # ══════════════════════════════════════════════════════════════════
     #  2. Deep Ensemble
     # ══════════════════════════════════════════════════════════════════
     if "ensemble" not in args.skip:
         print(f"\n{'='*60}")
-        print("Training Deep Ensemble (5 heads, cached features)")
+        print("Training Deep Ensemble (cached features)")
         print(f"{'='*60}")
         ens_cfg = bl_cfg.get("ensemble", {})
+        ens_members = ens_cfg.get("num_members", 5)
+        ens_layers = ens_cfg.get("num_layers", 2)
+        # Auto-size: TOTAL params across all members = NPM budget
+        ens_hidden = solve_ensemble_hidden_dim(
+            npm_trainable, embed_dim, num_classes, ens_members, ens_layers,
+        )
+        print(f"  Auto-sized: hidden_dim={ens_hidden}  "
+              f"({ens_members} members x {ens_layers} layers)")
         ensemble = PretrainedEnsemble(
             shared_backbone,
-            num_members=ens_cfg.get("num_members", 5),
-            num_classes=cfg["model"]["num_classes"],
+            num_members=ens_members,
+            num_classes=num_classes,
             dropout=cfg["model"].get("dropout", 0.1),
-            hidden_dim=ens_cfg.get("hidden_dim", 0),
-            num_layers=ens_cfg.get("num_layers", 1),
+            hidden_dim=ens_hidden,
+            num_layers=ens_layers,
         ).to(device)
         trainable = sum(p.numel() for p in ensemble.parameters() if p.requires_grad)
-        print(f"  Trainable: {trainable:,}")
+        per_head = sum(p.numel() for p in ensemble.heads[0].parameters())
+        print(f"  Trainable: {trainable:,}  ({per_head:,}/member x {ens_members})")
 
         t0 = time.perf_counter()
         train_ensemble_cached(
@@ -773,6 +1085,10 @@ def main():
         results["ensemble"] = {
             "accuracy": m["accuracy"], "nll": m["nll"],
             "brier": m["brier"], "ece": m["ece"],
+            "trainable_params": sum(p.numel() for p in ensemble.parameters() if p.requires_grad),
+            "per_member_params": sum(p.numel() for p in ensemble.heads[0].parameters()),
+            "num_members": ens_members,
+            "hidden_dim": ens_hidden,
             "aurc_entropy": sr["aurc"],
             "train_time_s": round(ens_time, 1),
         }
@@ -789,16 +1105,22 @@ def main():
     # ══════════════════════════════════════════════════════════════════
     if "mc_dropout" not in args.skip:
         print(f"\n{'='*60}")
-        print("Training MC-Dropout (10 samples, cached features)")
+        print("Training MC-Dropout (cached features)")
         print(f"{'='*60}")
         mc_cfg = bl_cfg.get("mc_dropout", {})
+        mc_layers = mc_cfg.get("num_layers", 3)
+        # Auto-size: single head = NPM budget
+        mc_hidden = solve_mc_hidden_dim(
+            npm_trainable, embed_dim, num_classes, mc_layers,
+        )
+        print(f"  Auto-sized: hidden_dim={mc_hidden}  ({mc_layers} layers)")
         mc_model = PretrainedMCDropout(
             shared_backbone,
             mc_samples=mc_cfg.get("mc_samples", 10),
-            num_classes=cfg["model"]["num_classes"],
+            num_classes=num_classes,
             dropout=cfg["model"].get("dropout", 0.1),
-            hidden_dim=mc_cfg.get("hidden_dim", 0),
-            num_layers=mc_cfg.get("num_layers", 1),
+            hidden_dim=mc_hidden,
+            num_layers=mc_layers,
         ).to(device)
         trainable = sum(p.numel() for p in mc_model.parameters() if p.requires_grad)
         print(f"  Trainable: {trainable:,}")
@@ -820,6 +1142,8 @@ def main():
         results["mc_dropout"] = {
             "accuracy": m["accuracy"], "nll": m["nll"],
             "brier": m["brier"], "ece": m["ece"],
+            "trainable_params": sum(p.numel() for p in mc_model.parameters() if p.requires_grad),
+            "hidden_dim": mc_hidden,
             "aurc_entropy": sr["aurc"],
             "train_time_s": round(mc_time, 1),
         }
@@ -836,19 +1160,28 @@ def main():
     # ══════════════════════════════════════════════════════════════════
     if "moe" not in args.skip:
         print(f"\n{'='*60}")
-        print("Training MoE (16 experts, top-4, cached features)")
+        print("Training MoE (cached features)")
         print(f"{'='*60}")
         moe_cfg = bl_cfg.get("moe", {})
+        moe_experts = moe_cfg.get("num_experts", 16)
+        moe_topk = moe_cfg.get("top_k", 4)
+        # Auto-size: total (router + all experts) = NPM budget
+        moe_hidden = solve_moe_hidden_dim(
+            npm_trainable, embed_dim, num_classes, moe_experts,
+        )
+        print(f"  Auto-sized: expert_hidden_dim={moe_hidden}  "
+              f"({moe_experts} experts, top-{moe_topk})")
         moe = PretrainedMoE(
             shared_backbone,
-            num_experts=moe_cfg.get("num_experts", 16),
-            top_k=moe_cfg.get("top_k", 4),
-            num_classes=cfg["model"]["num_classes"],
+            num_experts=moe_experts,
+            top_k=moe_topk,
+            num_classes=num_classes,
             dropout=cfg["model"].get("dropout", 0.1),
-            expert_hidden_dim=moe_cfg.get("expert_hidden_dim", 0),
+            expert_hidden_dim=moe_hidden,
         ).to(device)
         trainable = sum(p.numel() for p in moe.parameters() if p.requires_grad)
-        print(f"  Trainable: {trainable:,}")
+        per_expert = sum(p.numel() for p in moe.experts[0].parameters())
+        print(f"  Trainable: {trainable:,}  ({per_expert:,}/expert x {moe_experts})")
 
         t0 = time.perf_counter()
         train_baseline_cached(
@@ -867,6 +1200,10 @@ def main():
         results["moe"] = {
             "accuracy": m["accuracy"], "nll": m["nll"],
             "brier": m["brier"], "ece": m["ece"],
+            "trainable_params": sum(p.numel() for p in moe.parameters() if p.requires_grad),
+            "per_expert_params": sum(p.numel() for p in moe.experts[0].parameters()),
+            "num_experts": moe_experts,
+            "expert_hidden_dim": moe_hidden,
             "aurc_entropy": sr["aurc"],
             "train_time_s": round(moe_time, 1),
         }
@@ -880,14 +1217,300 @@ def main():
         print(f"  MoE: acc={m['accuracy']:.2%}  nll={m['nll']:.4f}")
 
     # ══════════════════════════════════════════════════════════════════
-    #  Summary
+    #  5. SNGP (Spectral-Normalized GP)
+    # ══════════════════════════════════════════════════════════════════
+    if "sngp" not in args.skip:
+        print(f"\n{'='*60}")
+        print("Training SNGP (cached features)")
+        print(f"{'='*60}")
+        sngp_cfg = bl_cfg.get("sngp", {})
+        sngp_head = SNGPHead(
+            embed_dim=shared_backbone.embed_dim,
+            num_classes=cfg["model"]["num_classes"],
+            hidden_dim=sngp_cfg.get("hidden_dim", 512),
+            rff_dim=sngp_cfg.get("rff_dim", 1024),
+            num_layers=sngp_cfg.get("num_layers", 2),
+            dropout=cfg["model"].get("dropout", 0.1),
+            lengthscale=sngp_cfg.get("lengthscale", 2.0),
+        ).to(device)
+        trainable = sum(p.numel() for p in sngp_head.parameters() if p.requires_grad)
+        print(f"  Trainable: {trainable:,}")
+
+        t0 = time.perf_counter()
+        train_sngp_cached(
+            sngp_head, train_feats, train_targets, device, epochs,
+            val_feats=val_feats, val_targets=val_targets,
+            batch_size=batch_size, label_smoothing=label_smoothing,
+            patience=patience,
+        )
+        sngp_time = time.perf_counter() - t0
+        print(f"  SNGP training: {sngp_time:.1f}s")
+
+        # Wrap for evaluation compatibility
+        sngp_head.eval()
+        m_sngp, probs_sngp, tgts_sngp = full_evaluation_baseline_cached(
+            sngp_head, test_feats, test_targets,
+        )
+        sr = selective_risk_curve(probs_sngp, tgts_sngp, m_sngp["entropy"])
+        results["sngp"] = {
+            "accuracy": m_sngp["accuracy"], "nll": m_sngp["nll"],
+            "brier": m_sngp["brier"], "ece": m_sngp["ece"],
+            "trainable_params": sum(p.numel() for p in sngp_head.parameters() if p.requires_grad),
+            "aurc_entropy": sr["aurc"],
+            "train_time_s": round(sngp_time, 1),
+        }
+        # SNGP-specific: GP variance as uncertainty
+        sngp_head.eval()
+        with torch.no_grad():
+            sngp_out_all = sngp_head.forward_on_features(test_feats)
+            gp_var = sngp_out_all["gp_variance"].cpu()
+        sr_gp = selective_risk_curve(probs_sngp, tgts_sngp, gp_var)
+        results["sngp"]["aurc_gp_var"] = sr_gp["aurc"]
+
+        sngp_ood = {}
+        for ood_name, ood_loader in ood_loaders.items():
+            sngp_ood[ood_name] = _baseline_ood_cached(
+                sngp_head, test_feats, ood_loader, shared_backbone, device,
+                score_fns=["entropy"],
+            )
+        results["sngp"]["ood"] = sngp_ood
+        print(f"  SNGP: acc={m_sngp['accuracy']:.2%}  nll={m_sngp['nll']:.4f}")
+
+    # ══════════════════════════════════════════════════════════════════
+    #  6. DUE (Deterministic Uncertainty Estimation)
+    # ══════════════════════════════════════════════════════════════════
+    if "due" not in args.skip:
+        print(f"\n{'='*60}")
+        print("Training DUE (cached features)")
+        print(f"{'='*60}")
+        due_cfg = bl_cfg.get("due", {})
+        due_head = DUEHead(
+            embed_dim=shared_backbone.embed_dim,
+            num_classes=cfg["model"]["num_classes"],
+            hidden_dim=due_cfg.get("hidden_dim", 512),
+            n_inducing=due_cfg.get("n_inducing", 20),
+            kernel_dim=due_cfg.get("kernel_dim", 128),
+            num_layers=due_cfg.get("num_layers", 2),
+            dropout=cfg["model"].get("dropout", 0.1),
+        ).to(device)
+        trainable = sum(p.numel() for p in due_head.parameters() if p.requires_grad)
+        print(f"  Trainable: {trainable:,}")
+
+        t0 = time.perf_counter()
+        train_baseline_cached(
+            due_head, train_feats, train_targets, device, epochs,
+            val_feats=val_feats, val_targets=val_targets,
+            batch_size=batch_size, name="DUE",
+            label_smoothing=label_smoothing, patience=patience,
+        )
+        due_time = time.perf_counter() - t0
+        print(f"  DUE training: {due_time:.1f}s")
+
+        m_due, probs_due, tgts_due = full_evaluation_baseline_cached(
+            due_head, test_feats, test_targets,
+        )
+        sr = selective_risk_curve(probs_due, tgts_due, m_due["entropy"])
+        results["due"] = {
+            "accuracy": m_due["accuracy"], "nll": m_due["nll"],
+            "brier": m_due["brier"], "ece": m_due["ece"],
+            "trainable_params": sum(p.numel() for p in due_head.parameters() if p.requires_grad),
+            "aurc_entropy": sr["aurc"],
+            "train_time_s": round(due_time, 1),
+        }
+        due_ood = {}
+        for ood_name, ood_loader in ood_loaders.items():
+            due_ood[ood_name] = _baseline_ood_cached(
+                due_head, test_feats, ood_loader, shared_backbone, device,
+                score_fns=["entropy"],
+            )
+        results["due"]["ood"] = due_ood
+        print(f"  DUE: acc={m_due['accuracy']:.2%}  nll={m_due['nll']:.4f}")
+
+    # ══════════════════════════════════════════════════════════════════
+    #  7. DUQ (Deterministic Uncertainty Quantification)
+    # ══════════════════════════════════════════════════════════════════
+    if "duq" not in args.skip:
+        print(f"\n{'='*60}")
+        print("Training DUQ (cached features)")
+        print(f"{'='*60}")
+        duq_cfg = bl_cfg.get("duq", {})
+        duq_head = DUQHead(
+            embed_dim=shared_backbone.embed_dim,
+            num_classes=cfg["model"]["num_classes"],
+            hidden_dim=duq_cfg.get("hidden_dim", 512),
+            centroid_dim=duq_cfg.get("centroid_dim", 256),
+            num_layers=duq_cfg.get("num_layers", 2),
+            dropout=cfg["model"].get("dropout", 0.1),
+            rbf_lengthscale=duq_cfg.get("rbf_lengthscale", 0.1),
+        ).to(device)
+        trainable = sum(p.numel() for p in duq_head.parameters() if p.requires_grad)
+        print(f"  Trainable: {trainable:,}")
+
+        t0 = time.perf_counter()
+        train_duq_cached(
+            duq_head, train_feats, train_targets, device, epochs,
+            val_feats=val_feats, val_targets=val_targets,
+            batch_size=batch_size, patience=patience,
+        )
+        duq_time = time.perf_counter() - t0
+        print(f"  DUQ training: {duq_time:.1f}s")
+
+        m_duq, probs_duq, tgts_duq = full_evaluation_baseline_cached(
+            duq_head, test_feats, test_targets,
+        )
+        sr = selective_risk_curve(probs_duq, tgts_duq, m_duq["entropy"])
+        results["duq"] = {
+            "accuracy": m_duq["accuracy"], "nll": m_duq["nll"],
+            "brier": m_duq["brier"], "ece": m_duq["ece"],
+            "trainable_params": sum(p.numel() for p in duq_head.parameters() if p.requires_grad),
+            "aurc_entropy": sr["aurc"],
+            "train_time_s": round(duq_time, 1),
+        }
+        duq_ood = {}
+        for ood_name, ood_loader in ood_loaders.items():
+            duq_ood[ood_name] = _baseline_ood_cached(
+                duq_head, test_feats, ood_loader, shared_backbone, device,
+                score_fns=["entropy"],
+            )
+        results["duq"]["ood"] = duq_ood
+        print(f"  DUQ: acc={m_duq['accuracy']:.2%}  nll={m_duq['nll']:.4f}")
+
+    # ══════════════════════════════════════════════════════════════════
+    #  8. Evidential Deep Learning
+    # ══════════════════════════════════════════════════════════════════
+    if "evidential" not in args.skip:
+        print(f"\n{'='*60}")
+        print("Training Evidential DL (cached features)")
+        print(f"{'='*60}")
+        edl_cfg = bl_cfg.get("evidential", {})
+        edl_head = EvidentialHead(
+            embed_dim=shared_backbone.embed_dim,
+            num_classes=cfg["model"]["num_classes"],
+            hidden_dim=edl_cfg.get("hidden_dim", 512),
+            num_layers=edl_cfg.get("num_layers", 2),
+            dropout=cfg["model"].get("dropout", 0.1),
+        ).to(device)
+        trainable = sum(p.numel() for p in edl_head.parameters() if p.requires_grad)
+        print(f"  Trainable: {trainable:,}")
+
+        t0 = time.perf_counter()
+        train_evidential_cached(
+            edl_head, train_feats, train_targets, device, epochs,
+            val_feats=val_feats, val_targets=val_targets,
+            batch_size=batch_size, patience=patience,
+        )
+        edl_time = time.perf_counter() - t0
+        print(f"  Evidential training: {edl_time:.1f}s")
+
+        m_edl, probs_edl, tgts_edl = full_evaluation_baseline_cached(
+            edl_head, test_feats, test_targets,
+        )
+        sr = selective_risk_curve(probs_edl, tgts_edl, m_edl["entropy"])
+        results["evidential"] = {
+            "accuracy": m_edl["accuracy"], "nll": m_edl["nll"],
+            "brier": m_edl["brier"], "ece": m_edl["ece"],
+            "trainable_params": sum(p.numel() for p in edl_head.parameters() if p.requires_grad),
+            "aurc_entropy": sr["aurc"],
+            "train_time_s": round(edl_time, 1),
+        }
+        # EDL-specific: vacuity as uncertainty
+        edl_head.eval()
+        with torch.no_grad():
+            edl_out_all = edl_head.forward_on_features(test_feats)
+            vacuity = edl_out_all["vacuity"].cpu()
+        sr_vac = selective_risk_curve(probs_edl, tgts_edl, vacuity)
+        results["evidential"]["aurc_vacuity"] = sr_vac["aurc"]
+
+        edl_ood = {}
+        for ood_name, ood_loader in ood_loaders.items():
+            edl_ood[ood_name] = _baseline_ood_cached(
+                edl_head, test_feats, ood_loader, shared_backbone, device,
+                score_fns=["entropy"],
+            )
+        results["evidential"]["ood"] = edl_ood
+        print(f"  Evidential: acc={m_edl['accuracy']:.2%}  nll={m_edl['nll']:.4f}")
+
+    # ══════════════════════════════════════════════════════════════════
+    #  9. Post-hoc OOD methods (Energy, ODIN, Mahalanobis, ViM, ReAct, KNN)
+    #     Applied to best trained head (ensemble or first available baseline)
     # ══════════════════════════════════════════════════════════════════
     print(f"\n{'='*60}")
-    print(f"PRETRAINED RESULTS — ID Metrics (backbone={backbone_name})")
+    print("Post-hoc OOD methods (Energy, ODIN, Mahalanobis, ViM, ReAct, KNN)")
     print(f"{'='*60}")
+
+    # Pick a trained head for post-hoc methods (prefer ensemble)
+    posthoc_heads = {}
+    if "ensemble" in results and "ensemble" not in args.skip:
+        posthoc_heads["ensemble"] = ensemble
+    if "sngp" in results and "sngp" not in args.skip:
+        posthoc_heads["sngp"] = sngp_head
+    if "evidential" in results and "evidential" not in args.skip:
+        posthoc_heads["evidential"] = edl_head
+
+    posthoc_results = {}
+    for head_name, head_model in posthoc_heads.items():
+        for ood_name, ood_loader in ood_loaders.items():
+            # Extract OOD features
+            head_model.eval()
+            ood_feats_list = []
+            with torch.no_grad():
+                for images, _ in ood_loader:
+                    images = images.to(device, non_blocking=True)
+                    ood_f = shared_backbone(images)
+                    ood_feats_list.append(ood_f)
+            ood_feats = torch.cat(ood_feats_list)
+
+            try:
+                ph = run_all_posthoc_ood(
+                    head_model, train_feats, train_targets,
+                    test_feats, ood_feats,
+                    num_classes=cfg["model"]["num_classes"],
+                )
+                key = f"posthoc_{head_name}"
+                if key not in posthoc_results:
+                    posthoc_results[key] = {}
+                posthoc_results[key][ood_name] = ph
+                print(f"  [{head_name}] {ood_name}: "
+                      + "  ".join(f"{m}={v['auroc']:.4f}" for m, v in ph.items()))
+            except Exception as e:
+                print(f"  [{head_name}] {ood_name}: post-hoc failed ({e})")
+
+    # Merge post-hoc results into main results
+    for key, ood_data in posthoc_results.items():
+        results[key] = {"ood": {}}
+        for ood_name, methods in ood_data.items():
+            results[key]["ood"][ood_name] = {}
+            for method_name, scores in methods.items():
+                results[key]["ood"][ood_name][method_name] = {
+                    "auroc": round(scores["auroc"], 4),
+                    "aupr": round(scores["aupr"], 4),
+                }
+
+    # ══════════════════════════════════════════════════════════════════
+    #  Summary
+    # ══════════════════════════════════════════════════════════════════
+    print(f"\n{'='*70}")
+    print(f"PRETRAINED RESULTS -- ID Metrics (backbone={backbone_name})")
+    print(f"{'='*70}")
+
+    # Parameter parity table
+    print(f"\n  --- Parameter Budget (target = NPM: {npm_trainable:,}) ---")
+    print(f"  {'model':15s} {'trainable':>12s} {'parity':>8s}")
     for name, r in results.items():
+        if not isinstance(r, dict) or "accuracy" not in r:
+            continue
+        tp = r.get("trainable_params", 0)
+        if tp > 0:
+            pct = (tp / npm_trainable - 1) * 100
+            print(f"  {name:15s} {tp:>12,} {pct:>+7.1f}%")
+    print()
+
+    for name, r in results.items():
+        if not isinstance(r, dict) or "accuracy" not in r:
+            continue
         t = r.get('train_time_s', 0)
         aurc_e = r.get('aurc_entropy', 0)
+        tp = r.get("trainable_params", 0)
         extra = ""
         if 'aurc_market' in r:
             extra = (f"  aurc_mkt={r['aurc_market']:.4f}"
@@ -898,35 +1521,44 @@ def main():
               f"brier={r.get('brier',0):.4f}  ece={r.get('ece',0):.4f}  "
               f"aurc_ent={aurc_e:.4f}{extra}  time={t:.0f}s")
 
-    # ── OOD Summary ──
+    # ── OOD Summary (OpenOOD v1.5 protocol) ──
     print(f"\n{'='*60}")
-    print(f"PRETRAINED RESULTS — OOD Detection (AUROC)")
+    print(f"PRETRAINED RESULTS -- OOD Detection (AUROC)")
+    print(f"OpenOOD v1.5 Protocol for Tiny ImageNet")
     print(f"{'='*60}")
-    for ood_name in ood_datasets:
-        print(f"\n  --- {ood_name} ---")
-        score_keys_seen = set()
-        for name, r in results.items():
-            if "ood" in r and ood_name in r["ood"]:
-                for sk in r["ood"][ood_name]:
-                    score_keys_seen.add(sk)
-        score_keys = sorted(score_keys_seen)
-        header = f"  {'model':15s}"
-        for sk in score_keys:
-            header += f"  {sk:>15s}"
-        print(header)
-        for name, r in results.items():
-            if "ood" not in r or ood_name not in r["ood"]:
-                continue
-            row = f"  {name:15s}"
+
+    # Print Near-OOD and Far-OOD separately
+    for category_label, category_list in [("NEAR-OOD", near_ood),
+                                           ("FAR-OOD", far_ood)]:
+        active = [n for n in category_list if n in ood_loaders]
+        if not active:
+            continue
+        print(f"\n  === {category_label} ===")
+        for ood_name in active:
+            print(f"\n  --- {ood_name} ---")
+            score_keys_seen = set()
+            for name, r in results.items():
+                if "ood" in r and ood_name in r["ood"]:
+                    for sk in r["ood"][ood_name]:
+                        score_keys_seen.add(sk)
+            score_keys = sorted(score_keys_seen)
+            header = f"  {'model':15s}"
             for sk in score_keys:
-                ood_data = r["ood"][ood_name]
-                if sk in ood_data:
-                    v = ood_data[sk]
-                    auroc = v["auroc"] if isinstance(v, dict) else v
-                    row += f"  {auroc:>15.4f}"
-                else:
-                    row += f"  {'—':>15s}"
-            print(row)
+                header += f"  {sk:>15s}"
+            print(header)
+            for name, r in results.items():
+                if "ood" not in r or ood_name not in r["ood"]:
+                    continue
+                row = f"  {name:15s}"
+                for sk in score_keys:
+                    ood_data = r["ood"][ood_name]
+                    if sk in ood_data:
+                        v = ood_data[sk]
+                        auroc = v["auroc"] if isinstance(v, dict) else v
+                        row += f"  {auroc:>15.4f}"
+                    else:
+                        row += f"  {'--':>15s}"
+                print(row)
 
     # Save results
     out_dir = Path("results")

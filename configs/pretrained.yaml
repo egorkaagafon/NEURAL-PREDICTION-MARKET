@@ -1,31 +1,41 @@
 # ─── Pretrained Backbone Config ───
-# Frozen pretrained ViT backbone + trainable NPM/baseline heads.
+# Frozen pretrained backbone + trainable NPM/baseline heads.
 # Clean comparison: same features, different uncertainty methods.
 # All models sized to ~1.3–1.5M trainable params for fair comparison.
+#
+# Supported backbones (override with --backbone):
+#   deit_tiny_patch16_224   (embed_dim=192, 5.7M frozen)
+#   deit_small_patch16_224  (embed_dim=384, 22M frozen)  — small transformer
+#   vit_small_patch16_224   (embed_dim=384, 22M frozen)
+#   resnet18                (embed_dim=512, 11.7M frozen)
+#   resnet50                (embed_dim=2048, 25.6M frozen)
 
 seed: 42
 device: "cuda"
 
 # ── Data ──
 data:
-  dataset: "cifar10"
+  dataset: "tiny_imagenet"     # Tiny ImageNet (200 classes, 64×64 → 224)
   root: "./data"
   batch_size: 512         # cached features are tiny → large batches OK
   num_workers: 2          # Colab has 2 CPUs; only used for initial caching
-  image_size: 224         # resize CIFAR to match pretrained models
+  image_size: 224         # resize to match pretrained models
   persistent_workers: false
   prefetch_factor: 2
 
 # ── Backbone ──
 backbone:
   name: "deit_tiny_patch16_224"   # 5.7M params, embed_dim=192
-  # alternatives: vit_small_patch16_224 (22M, embed_dim=384)
+  # alternatives:
+  #   deit_small_patch16_224   — small transformer (22M, embed_dim=384)
+  #   resnet18                 — CNN baseline (11.7M, embed_dim=512)
+  #   resnet50                 — strong CNN (25.6M, embed_dim=2048)
   freeze: true
 
 # ── NPM agents ──
 model:
   num_agents: 16
-  num_classes: 10
+  num_classes: 200          # Tiny ImageNet = 200 classes
   dropout: 0.2              # ↑ from 0.1 to reduce overfitting
   label_smoothing: 0.1      # cross-entropy label smoothing
 
@@ -56,23 +66,54 @@ training:
   gradient_clip: 1.0
   early_stopping_patience: 10   # restore best val model after patience epochs
 
-# ── Baselines (param-matched to NPM ~1.5M) ──
+# ── Baselines ──
+# PARAMETER-MATCHING POLICY: all baselines are auto-sized at runtime so
+# that their TOTAL trainable param count matches NPM's budget.
+# For multi-component models (ensemble, MoE) the budget is divided across
+# members/experts — each component is therefore smaller than NPM.
+# The hidden_dim values below are reference defaults for deit_tiny
+# (embed_dim=192); they are overridden by solve_*_hidden_dim() in
+# run_pretrained.py.  Only structural hyperparams (num_members, num_layers,
+# num_experts, etc.) are taken from this config.
 baselines:
   ensemble:
     num_members: 5
-    hidden_dim: 448       # 5 × ~292K = ~1.46M trainable
-    num_layers: 2
+    num_layers: 2           # auto-sized hidden_dim ≈ 480 for deit_tiny
   mc_dropout:
-    hidden_dim: 768       # 3-layer → ~1.34M trainable
-    num_layers: 3
+    num_layers: 3           # auto-sized hidden_dim ≈ 930 for deit_tiny
     mc_samples: 10
   moe:
     num_experts: 16
-    top_k: 4
-    expert_hidden_dim: 224  # 16 × 2-layer → ~1.54M trainable
+    top_k: 4                # auto-sized expert_hidden_dim ≈ 215 for deit_tiny
+  # ── New UQ baselines (not auto-sized — use specified dims) ──
+  sngp:                     # Spectral-Normalized GP (Liu et al., 2020)
+    hidden_dim: 512
+    rff_dim: 1024           # Random Fourier Feature dimensionality
+    num_layers: 2
+    lengthscale: 2.0        # RBF kernel lengthscale for RFF
+  due:                      # Deterministic Uncertainty Estimation (van Amersfoort, 2021)
+    hidden_dim: 512
+    n_inducing: 20          # inducing points per class
+    kernel_dim: 128         # RBF kernel embedding dimensionality
+    num_layers: 2
+  duq:                      # Deterministic Uncertainty Quantification (van Amersfoort, 2020)
+    hidden_dim: 512
+    centroid_dim: 256       # class centroid dimensionality
+    num_layers: 2
+    rbf_lengthscale: 0.1    # RBF kernel lengthscale
+  evidential:               # Evidential Deep Learning (Sensoy et al., 2018)
+    hidden_dim: 512
+    num_layers: 2
 
-# ── Evaluation ──
+# ── Evaluation (OpenOOD v1.5 protocol) ──
 evaluation:
-  ood_datasets: ["cifar100", "svhn"]
+  # Near-OOD: semantic shift relative to Tiny ImageNet 200 classes
+  near_ood: ["ssb_hard", "imagenet_o"]
+  # Far-OOD: distribution shift from unrelated visual domains
+  far_ood:  ["inaturalist", "sun", "places", "textures"]
+  # All OOD datasets combined (order: near first, then far)
+  ood_datasets: ["ssb_hard", "imagenet_o", "inaturalist", "sun", "places", "textures"]
+  # Subsample large OOD sets (0 = use all); SUN/Places can be huge
+  max_ood_samples: 10000
   volatility_eps: 0.05
   volatility_steps: 10

@@ -1,8 +1,8 @@
 """
-NPM with a frozen pretrained ViT backbone (from timm).
+NPM with a frozen pretrained backbone (from timm).
 
 Architecture:
-  Frozen ViT backbone (e.g. DeiT-Tiny, ViT-Small)  →  CLS token [B, D]
+  Frozen backbone (ViT, DeiT, ResNet, …)  →  feature vector [B, D]
        ↓
   AgentPool (K agents, each with feature_mask + head + bet)
        ↓
@@ -12,11 +12,20 @@ Only the agent heads are trained.  The backbone is frozen (no gradient).
 This isolates the contribution of the NPM market mechanism from
 backbone quality, enabling clean ablation and fair comparison with
 other uncertainty methods on the *same* features.
+
+Supported backbone families (via timm):
+  ViT / DeiT:
+    - deit_tiny_patch16_224   (5.7 M, embed_dim=192)
+    - deit_small_patch16_224  (22 M, embed_dim=384)  — "small transformer"
+    - vit_small_patch16_224   (22 M, embed_dim=384)
+  ResNet:
+    - resnet18                (11.7 M, embed_dim=512)
+    - resnet50                (25.6 M, embed_dim=2048)
 """
 
 from __future__ import annotations
 
-from typing import Optional
+from typing import Optional, Dict, Any
 
 import torch
 import torch.nn as nn
@@ -27,17 +36,157 @@ from npm_core.agents import AgentPool
 from npm_core.market import MarketAggregator
 
 
+# ══════════════════════════════════════════════════════════════════════
+#  Backbone registry — quick look-up of supported backbones
+# ══════════════════════════════════════════════════════════════════════
+
+BACKBONE_REGISTRY: Dict[str, Dict[str, Any]] = {
+    # ── Vision Transformers ──
+    "deit_tiny_patch16_224": {
+        "family": "vit", "embed_dim": 192, "params_m": 5.7,
+        "description": "DeiT-Tiny — lightweight ViT (default)",
+    },
+    "deit_small_patch16_224": {
+        "family": "vit", "embed_dim": 384, "params_m": 22,
+        "description": "DeiT-Small — larger ViT with richer features",
+    },
+    "vit_small_patch16_224": {
+        "family": "vit", "embed_dim": 384, "params_m": 22,
+        "description": "ViT-Small (original ViT, patch-16)",
+    },
+    # ── ResNets ──
+    "resnet18": {
+        "family": "cnn", "embed_dim": 512, "params_m": 11.7,
+        "description": "ResNet-18 — classic CNN baseline",
+    },
+    "resnet50": {
+        "family": "cnn", "embed_dim": 2048, "params_m": 25.6,
+        "description": "ResNet-50 — strong CNN baseline",
+    },
+}
+
+
+def list_backbones() -> None:
+    """Print a table of supported backbone models."""
+    print(f"{'name':<30s} {'family':<6s} {'dim':>5s} {'params':>8s}  description")
+    print("-" * 90)
+    for name, info in BACKBONE_REGISTRY.items():
+        print(f"{name:<30s} {info['family']:<6s} {info['embed_dim']:>5d} "
+              f"{info['params_m']:>7.1f}M  {info['description']}")
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  Parameter-budget utilities for fair comparison
+# ══════════════════════════════════════════════════════════════════════
+
+def _head_params(embed_dim: int, hidden_dim: int, num_classes: int,
+                 num_layers: int) -> int:
+    """Exact trainable-param count for a PretrainedClassifierHead."""
+    # LayerNorm(embed_dim): 2 * embed_dim
+    p = 2 * embed_dim
+    # First linear: embed_dim -> hidden_dim
+    p += embed_dim * hidden_dim + hidden_dim
+    # Additional hidden layers: hidden_dim -> hidden_dim
+    for _ in range(num_layers - 1):
+        p += hidden_dim * hidden_dim + hidden_dim
+    # Output linear: hidden_dim -> num_classes
+    p += hidden_dim * num_classes + num_classes
+    return p
+
+
+def _moe_params(embed_dim: int, expert_hidden_dim: int, num_classes: int,
+                num_experts: int) -> int:
+    """Exact trainable-param count for a PretrainedMoE."""
+    # Router: Linear(embed_dim, num_experts)
+    p = embed_dim * num_experts + num_experts
+    # Each expert: LN(embed_dim) + Linear(D,h) + Linear(h,h) + Linear(h,C)
+    per_expert = (2 * embed_dim                               # LayerNorm
+                  + embed_dim * expert_hidden_dim + expert_hidden_dim   # Linear 1
+                  + expert_hidden_dim ** 2 + expert_hidden_dim         # Linear 2
+                  + expert_hidden_dim * num_classes + num_classes)      # Linear 3
+    p += num_experts * per_expert
+    return p
+
+
+def solve_ensemble_hidden_dim(target_params: int, embed_dim: int,
+                              num_classes: int, num_members: int,
+                              num_layers: int) -> int:
+    """Find hidden_dim so that num_members × per-head params ≈ target_params.
+
+    Binary search for the closest integer hidden_dim.
+    """
+    per_head_target = target_params / num_members
+    lo, hi = 8, 4096
+    while lo < hi:
+        mid = (lo + hi) // 2
+        if _head_params(embed_dim, mid, num_classes, num_layers) < per_head_target:
+            lo = mid + 1
+        else:
+            hi = mid
+    # Return the value whose total is closest to target
+    best_h, best_diff = lo, float("inf")
+    for h in range(max(8, lo - 2), lo + 3):
+        total = num_members * _head_params(embed_dim, h, num_classes, num_layers)
+        if abs(total - target_params) < best_diff:
+            best_diff = abs(total - target_params)
+            best_h = h
+    return best_h
+
+
+def solve_mc_hidden_dim(target_params: int, embed_dim: int,
+                        num_classes: int, num_layers: int) -> int:
+    """Find hidden_dim for MC-Dropout (single head) ≈ target_params."""
+    lo, hi = 8, 4096
+    while lo < hi:
+        mid = (lo + hi) // 2
+        if _head_params(embed_dim, mid, num_classes, num_layers) < target_params:
+            lo = mid + 1
+        else:
+            hi = mid
+    best_h, best_diff = lo, float("inf")
+    for h in range(max(8, lo - 2), lo + 3):
+        diff = abs(_head_params(embed_dim, h, num_classes, num_layers) - target_params)
+        if diff < best_diff:
+            best_diff = diff
+            best_h = h
+    return best_h
+
+
+def solve_moe_hidden_dim(target_params: int, embed_dim: int,
+                         num_classes: int, num_experts: int) -> int:
+    """Find expert_hidden_dim for MoE ≈ target_params."""
+    lo, hi = 8, 2048
+    while lo < hi:
+        mid = (lo + hi) // 2
+        if _moe_params(embed_dim, mid, num_classes, num_experts) < target_params:
+            lo = mid + 1
+        else:
+            hi = mid
+    best_h, best_diff = lo, float("inf")
+    for h in range(max(8, lo - 2), lo + 3):
+        diff = abs(_moe_params(embed_dim, h, num_classes, num_experts) - target_params)
+        if diff < best_diff:
+            best_diff = diff
+            best_h = h
+    return best_h
+
+
 class PretrainedNPM(nn.Module):
-    """NPM with a frozen pretrained ViT backbone.
+    """NPM with a frozen pretrained backbone.
 
     Parameters
     ----------
     backbone_name : str
-        timm model name (e.g. 'deit_tiny_patch16_224', 'vit_small_patch16_224').
+        timm model name.  See ``BACKBONE_REGISTRY`` for tested options:
+        - ViT/DeiT:  'deit_tiny_patch16_224', 'deit_small_patch16_224',
+                      'vit_small_patch16_224'
+        - ResNet:     'resnet18', 'resnet50'
+        Any timm model with ``num_classes=0`` that produces a 1-D feature
+        vector is supported.
     num_agents : int
         Number of agent heads.
     num_classes : int
-        Number of output classes.
+        Number of output classes (e.g. 200 for Tiny ImageNet).
     dropout : float
         Dropout in agent heads.
     bet_temperature : float
@@ -161,13 +310,15 @@ class PretrainedNPM(nn.Module):
 # ══════════════════════════════════════════════════════════════════════
 
 class PretrainedBackbone(nn.Module):
-    """Frozen pretrained backbone that returns CLS features.
+    """Frozen pretrained backbone that returns feature vectors.
 
     Shared by all pretrained baselines for fair comparison.
+    Supports both ViT/DeiT and CNN (ResNet) backbones via timm.
     """
 
     def __init__(self, backbone_name: str = "deit_tiny_patch16_224"):
         super().__init__()
+        self.backbone_name = backbone_name
         self.model = timm.create_model(
             backbone_name, pretrained=True, num_classes=0,
         )
@@ -176,6 +327,10 @@ class PretrainedBackbone(nn.Module):
         for p in self.model.parameters():
             p.requires_grad = False
         self.model.eval()
+
+        family = BACKBONE_REGISTRY.get(backbone_name, {}).get("family", "unknown")
+        print(f"  Backbone: {backbone_name}  family={family}  "
+              f"embed_dim={self.embed_dim}  (frozen)")
 
     def train(self, mode: bool = True):
         super().train(mode)
@@ -214,7 +369,12 @@ class PretrainedEnsemble(nn.Module):
     """Deep ensemble: M independent heads on shared frozen backbone.
 
     Each member has its own randomly-initialised head.
-    Total trainable params ≈ M × head_params.
+
+    **Parameter matching policy** (important for fair comparison):
+    Total trainable params = M x per_head_params.  When comparing to
+    NPM (or any single model), hidden_dim must be set so that the
+    *aggregate* trainable budget matches, NOT the per-member budget.
+    Use ``solve_ensemble_hidden_dim()`` to compute the correct value.
     """
 
     def __init__(self, backbone: PretrainedBackbone,
